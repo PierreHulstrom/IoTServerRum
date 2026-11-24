@@ -1,0 +1,21 @@
+# Hemmeligheder & private TLS-nøgler (ALDRIG i Git!)
+.env
+mosquitto/certs/
+mosquitto/config/passwd
+
+# Runtime-data & logs
+mosquitto/data/
+mosquitto/log/
+*.log
+
+# Python & IDE-filer
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+
+# Rapportfiler (hold GitHub rent til kode & guides)
+*.docx
+*.pdf
+mosquitto/config/acl

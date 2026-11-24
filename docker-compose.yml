@@ -1,0 +1,61 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: serverroom-mosquitto
+    restart: unless-stopped
+    ports:
+      - "8883:8883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/certs:/mosquitto/certs:ro
+      - ./mosquitto/data:/mosquitto/data
+      - ./mosquitto/log:/mosquitto/log
+
+  mariadb:
+    image: mariadb:11
+    container_name: serverroom-db
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Copenhagen
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: serverroom-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: Europe/Copenhagen
+      DB_HOST: mariadb
+      MQTT_HOST: mosquitto
+      MQTT_PORT: 1883
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: serverroom-caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./mosquitto/certs:/certs:ro
+    depends_on:
+      - backend
+
+volumes:
+  db_data:

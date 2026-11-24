@@ -1,0 +1,12 @@
+user pi-node
+topic write serverroom/+/telemetry
+topic write serverroom/+/status
+topic write serverroom/access/request
+topic write serverroom/access/event
+topic read serverroom/+/cmd
+topic read serverroom/access/response
+
+user backend
+topic read serverroom/#
+topic write serverroom/+/cmd
+topic write serverroom/access/response

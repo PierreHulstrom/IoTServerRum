@@ -1,0 +1,16 @@
+{
+    auto_https off
+}
+
+https://serverrum-iot-2026.swedencentral.cloudapp.azure.com {
+    tls /certs/fullchain.pem /certs/privkey.pem
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "SAMEORIGIN"
+        -Server
+    }
+
+    reverse_proxy backend:8000
+}
