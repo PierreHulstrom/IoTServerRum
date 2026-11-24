@@ -18,7 +18,7 @@ def analyze_reading(device_id: str, temp, hum, noise):
     # 1. Hårde serverrums-grænser (ASHRAE)
     if temp is not None and (temp > TEMP_MAX or temp < TEMP_MIN):
         is_anomaly = True
-        reasons.append(f"Temperatur uden for ASHRAE-grænse ({temp:.1f} C)")
+        reasons.append(f"Temperatur uden for ASHRAE-grænse ({temp:.1f} °C)")
     if hum is not None and (hum > HUM_MAX or hum < HUM_MIN):
         is_anomaly = True
         reasons.append(f"Luftfugtighed uden for grænse ({hum:.1f} %)")
@@ -57,19 +57,20 @@ def analyze_reading(device_id: str, temp, hum, noise):
             is_anomaly = True
             reasons.append(f"AI Isolation Forest afvigelse (score={anomaly_score:.3f})")
 
-    # 4. Trend-forudsigelse: hvornår rammer temperaturen kritisk 27 C?
+    # 4. Trend-forudsigelse (kræver reel stigning >= 0.8 °C over min. 45 sek, output i hele minutter)
     recent = list(reversed(rows[:15]))
-    if len(recent) >= 5 and temp is not None and temp < TEMP_MAX:
+    if len(recent) >= 10 and temp is not None and temp < TEMP_MAX:
         times_min = np.array([(r["ts"] - recent[0]["ts"]) / 60.0 for r in recent])
         temps = np.array([r["temperature"] for r in recent])
-        if times_min[-1] > 0.2:
+        temp_rise = float(temps[-1] - temps[0])
+        if times_min[-1] >= 0.75 and temp_rise >= 0.8:
             slope_per_min = float(np.polyfit(times_min, temps, 1)[0])
-            if slope_per_min > 0.05:  # stiger mere end 0.05 C/min
-                mins_left = (TEMP_MAX - temp) / slope_per_min
-                if 0 < mins_left <= 120:
-                    predicted_critical_min = round(mins_left, 1)
+            if slope_per_min >= 0.25:
+                mins_left = max(1, int(round((TEMP_MAX - temp) / slope_per_min)))
+                if mins_left <= 120:
+                    predicted_critical_min = mins_left
                     reasons.append(
-                        f"Forudsigelse: kritisk temp ({TEMP_MAX} C) om ca. {predicted_critical_min} min"
+                        f"Forudsigelse: kritisk temp ({int(TEMP_MAX)} °C) om ca. {mins_left} min"
                     )
 
     # 5. Gem i ai_anomalies og system_logs hvis der er afvigelse eller forudsigelse
