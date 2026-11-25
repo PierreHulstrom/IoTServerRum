@@ -14,11 +14,14 @@ def analyze_reading(device_id: str, temp, hum, noise):
     is_anomaly = False
     anomaly_score = 0.0
     predicted_critical_min = None
+    critical_action_needed = False
 
     # 1. Hårde serverrums-grænser (ASHRAE)
     if temp is not None and (temp > TEMP_MAX or temp < TEMP_MIN):
         is_anomaly = True
         reasons.append(f"Temperatur uden for ASHRAE-grænse ({temp:.1f} °C)")
+        if temp > TEMP_MAX:
+            critical_action_needed = True
     if hum is not None and (hum > HUM_MAX or hum < HUM_MIN):
         is_anomaly = True
         reasons.append(f"Luftfugtighed uden for grænse ({hum:.1f} %)")
@@ -26,7 +29,7 @@ def analyze_reading(device_id: str, temp, hum, noise):
         is_anomaly = True
         reasons.append(f"Højt støjniveau ({noise:.1f} dB)")
 
-    # 2. Hent historik til AI-model & trendforudsigelse
+    # 2. Hent historik til flatline-tjek, AI-model & trendforudsigelse
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -44,14 +47,21 @@ def analyze_reading(device_id: str, temp, hum, noise):
             )
             rows = cur.fetchall()
 
-    # 3. Hybrid ML (Isolation Forest + Robust Z-score mod stabil baseline)
+    # 2B. Sensordefekt / Flatline-detektion (20 helt identiske temp+fugt målinger i træk)
+    if len(rows) >= 20:
+        last20 = rows[:20]
+        t_vals = {round(float(r["temperature"]), 2) for r in last20}
+        h_vals = {round(float(r["humidity"]), 2) for r in last20}
+        if len(t_vals) == 1 and len(h_vals) == 1:
+            is_anomaly = True
+            reasons.append("Mulig sensordefekt: DHT22 flatline (20 identiske målinger i træk)")
+
+    # 3. Hybrid ML (Robust multivariat Z-score + Unsupervised Isolation Forest)
     if len(rows) >= 20 and None not in (temp, hum, noise):
-        # Ekskludér nyeste række hvis >20 rækker, så en ny outlier ikke forurener sin egen baseline
         hist = rows[1:] if len(rows) > 20 else rows
         X = np.array([[r["temperature"], r["humidity"], r["noise_db"]] for r in hist], dtype=float)
         current = np.array([[temp, hum, noise]], dtype=float)
 
-        # 3A: Robust multivariat Z-score (fanger spring selv ved helt flad/stabil baseline)
         means = np.mean(X, axis=0)
         stds = np.maximum(np.std(X, axis=0), np.array([0.5, 1.5, 2.0]))
         max_z = float(np.max(np.abs((current[0] - means) / stds)))
@@ -60,17 +70,16 @@ def analyze_reading(device_id: str, temp, hum, noise):
             anomaly_score = round(max_z, 2)
             reasons.append(f"AI Z-score afvigelse (z={max_z:.1f})")
 
-        # 3B: Unsupervised Isolation Forest (fanger komplekse mønster-afvigelser)
         model = IsolationForest(contamination=0.05, random_state=42)
         model.fit(X)
-        pred = int(model.predict(current)[0])       # -1 = anomaly, 1 = normal
+        pred = int(model.predict(current)[0])
         iso_score = float(-model.decision_function(current)[0])
         if pred == -1:
             is_anomaly = True
             anomaly_score = max(anomaly_score, round(iso_score, 4))
             reasons.append(f"AI Isolation Forest afvigelse (score={iso_score:.3f})")
 
-    # 4. Trend-forudsigelse (kræver reel stigning >= 0.8 °C over min. 45 sek, output i hele minutter)
+    # 4. Trend-forudsigelse (støjfilter + hele minutter uden decimaler)
     recent = list(reversed(rows[:15]))
     if len(recent) >= 10 and temp is not None and temp < TEMP_MAX:
         times_min = np.array([(r["ts"] - recent[0]["ts"]) / 60.0 for r in recent])
@@ -85,8 +94,10 @@ def analyze_reading(device_id: str, temp, hum, noise):
                     reasons.append(
                         f"Forudsigelse: kritisk temp ({int(TEMP_MAX)} °C) om ca. {mins_left} min"
                     )
+                    if mins_left <= 5:
+                        critical_action_needed = True
 
-    # 5. Gem i ai_anomalies og system_logs hvis der er afvigelse eller forudsigelse
+    # 5. Gem i ai_anomalies og system_logs
     if is_anomaly or predicted_critical_min is not None:
         msg = "; ".join(reasons)
         with get_conn() as conn:
@@ -116,5 +127,6 @@ def analyze_reading(device_id: str, temp, hum, noise):
         "is_anomaly": is_anomaly,
         "anomaly_score": anomaly_score,
         "predicted_critical_min": predicted_critical_min,
+        "critical_action_needed": critical_action_needed,
         "reasons": reasons,
     }

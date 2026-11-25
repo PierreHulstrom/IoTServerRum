@@ -1,0 +1,15 @@
+[Unit]
+Description=Serverrum IoT Edge Bridge (Arduino <-> Azure MQTTS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kongerne
+WorkingDirectory=/home/kongerne/IoTServerRum/edge/raspberry_pi
+ExecStart=/home/kongerne/IoTServerRum/edge/raspberry_pi/.venv/bin/python3 pi_agent.py --serial /dev/ttyACM0
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

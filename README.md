@@ -1,22 +1,22 @@
 # Serverrum IoT – Miljøovervågning, AI Anomaly Detection & Adgangskontrol
 
-Sikkert IoT-system med tovejskommunikation mellem Edge (Raspberry Pi + Arduino) og Azure Cloud (Docker).
+Sikkert og pålideligt IoT-system med tovejskommunikation mellem Edge (Arduino Mega 2560 + Raspberry Pi Bridge) og Azure Cloud (Docker).
 
 ## Arkitektur
-- **Edge (`edge/`):** Raspberry Pi (Python) + Arduino til miljøsensorer (temperatur, luftfugtighed, støj), fysisk adgangskontrol og aktuatorer.
-- **MQTTS Broker (`mosquitto/`):** Eclipse Mosquitto over TLS 1.2+ (port `8883`), brugernavn/password (PBKDF2-SHA512) og topic-baseret ACL (*least privilege*).
-- **Database (`db/`):** MariaDB 11 (kun internt i Docker-netværk) til målinger, AI-afvigelser, hashede adgangskort, adgangslog, driftstatus og auditlogs.
-- **Backend & AI (`backend/`):** Python FastAPI, `paho-mqtt`, `scikit-learn` (Isolation Forest) og `numpy` (lineær trendforudsigelse) + sikret Operations Center web-dashboard.
-- **Reverse Proxy (`caddy/`):** Caddy over ren HTTPS (port `443`) med TLS + HSTS-sikkerhedsheadere (port `80` holdes lukket).
+- **Edge (`edge/`):**
+  - `edge/arduino/`: Arduino Mega 2560 firmware & pin-plan (`WIRING.md`) til DHT22, lydsensor, RTC DS3231, RC522 RFID + 4x4 Keypad (2FA), LCD 1602, 3 LED'er og passiv buzzer.
+  - `edge/raspberry_pi/`: Python Edge Bridge (`pi_agent.py`) med MQTTS (TLS 1.2+), LWT, heartbeat, lokal SQLite offline-buffer og `systemd` auto-start (`serverroom-bridge.service`).
+- **MQTTS Broker (`mosquitto/`):** Eclipse Mosquitto over TLS 1.2+ (port `8883`), PBKDF2-SHA512 login og topic-baseret ACL (*least privilege*).
+- **Database (`db/` + `scripts/backup_db.sh`):** MariaDB 11 (kun internt Docker-netværk) med 7 tabeller, automatisk GDPR-dataretention og daglig komprimeret backup.
+- **Backend & Hybrid-AI (`backend/`):** Python FastAPI, `paho-mqtt`, 4-lags Hybrid-AI (ASHRAE TC 9.9 + robust Z-score + Isolation Forest + heltals-trendforudsigelse + flatline-sensordefekt), autonom AI-køling, brute-force beskyttelse (`429` på web-login + dør-alarm ved 3 afviste forsøg) samt live Operations Center dashboard.
+- **Reverse Proxy (`caddy/`):** Caddy udelukkende over HTTPS (port `443`) med TLS + HSTS og sikkerhedsheadere (port `80` holdes lukket).
 
-## Mappestruktur
-- `docker-compose.yml` – Samlet orkestrering af Mosquitto, MariaDB, Backend & Caddy
-- `.env.example` – Skabelon til miljøvariabler (kopieres til `.env`)
-- `db/init.sql` – MariaDB-skema (7 tabeller)
-- `mosquitto/config/` – `mosquitto.conf` & `acl.example`
-- `caddy/Caddyfile` – HTTPS reverse proxy (port 443 + HSTS)
-- `backend/` – FastAPI API, MQTT-worker, AI-motor & Web-dashboard
-- `edge/` – Raspberry Pi (Python) & Arduino kode
+## Kvalitetssikring & Automatiserede Tests
+Kør alle 28 enheds-, integrations- og sikkerhedstests i backend-containeren:
+    docker exec serverroom-backend python -m unittest discover -s tests -v
+
+Kør uafhængig statisk sikkerhedsscanning med Bandit:
+    docker run --rm -v /opt/serverroom-iot:/src:ro python:3.11-slim sh -c "pip install -q bandit && bandit -r /src/backend /src/edge -x /src/backend/tests"
 
 ## Hurtig start (Server)
 1. Kopiér `.env.example` til `.env` og udfyld stærke adgangskoder (`chmod 660 .env`).

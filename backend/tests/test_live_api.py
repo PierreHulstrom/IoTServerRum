@@ -84,3 +84,19 @@ class TestLiveAPIAndSecurity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestLiveRateLimit(unittest.TestCase):
+    def test_08_login_rate_limit_returns_429(self):
+        hdrs = {"X-Forwarded-For": "203.0.113.99"}
+        codes = []
+        for _ in range(6):
+            c, _, _ = req(
+                f"{BASE_LOCAL}/api/login",
+                method="POST",
+                body={"username": USER, "password": "forkert_test_pass"},
+                headers=hdrs,
+            )
+            codes.append(c)
+        self.assertEqual(codes[:5], [401, 401, 401, 401, 401])
+        self.assertEqual(codes[5], 429)

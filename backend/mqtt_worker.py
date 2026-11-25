@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from collections import defaultdict
 import paho.mqtt.client as mqtt
 from db import get_conn
 from ai_engine import analyze_reading
@@ -12,8 +13,30 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_BACKEND_USER", "backend")
 MQTT_PASS = os.getenv("MQTT_BACKEND_PASS", "")
 
+RETENTION_SENSOR_DAYS = int(os.getenv("RETENTION_SENSOR_DAYS", "30"))
+RETENTION_ACCESS_DAYS = int(os.getenv("RETENTION_ACCESS_DAYS", "90"))
+
 _client = None
 _connected = False
+
+# Indstilling for autonom AI -> fjernstyring (kan skiftes live i dashboardet)
+_auto_cooling_enabled = True
+_last_auto_action_ts: dict[str, float] = {}
+
+# Brute-force sporing for fysisk dørlæser (3 fejl inden for 60 sek -> alarm)
+_failed_access_attempts: dict[str, list[float]] = defaultdict(list)
+DOOR_BRUTEFORCE_LIMIT = 3
+DOOR_BRUTEFORCE_WINDOW_SEC = 60
+
+
+def get_auto_cooling() -> bool:
+    return _auto_cooling_enabled
+
+
+def set_auto_cooling(enabled: bool) -> bool:
+    global _auto_cooling_enabled
+    _auto_cooling_enabled = bool(enabled)
+    return _auto_cooling_enabled
 
 
 def hash_credential(raw_value: str) -> str:
@@ -29,7 +52,7 @@ def log_system(source: str, level: str, message: str, details: dict | None = Non
                     (source, level, message, json.dumps(details or {})),
                 )
     except Exception as e:
-        print(f"[log_system error] {e}")
+        print(f"[log_system error] {e}", flush=True)
 
 
 def update_device_status(device_id: str, status: str, meta: dict | None = None):
@@ -65,7 +88,19 @@ def _handle_telemetry(device_id: str, payload: dict):
             )
 
     update_device_status(device_id, "online", {"zone": zone})
-    analyze_reading(device_id, temp, hum, noise)
+    ai_res = analyze_reading(device_id, temp, hum, noise)
+
+    # Autonom Closed-Loop AI -> Fjernstyring (med 60s cooldown)
+    if _auto_cooling_enabled and ai_res.get("critical_action_needed"):
+        now = time.time()
+        if now - _last_auto_action_ts.get(device_id, 0) >= 60:
+            _last_auto_action_ts[device_id] = now
+            publish_command(
+                device_id,
+                "fan_on",
+                {"reason": "ai_auto_protection", "temp": temp},
+                issued_by="ai_autopilot",
+            )
 
 
 def _handle_status(device_id: str, raw_text: str):
@@ -83,7 +118,7 @@ def _handle_status(device_id: str, raw_text: str):
 
 
 def _handle_access_request(payload: dict):
-    device_id = str(payload.get("device_id", "door1"))
+    device_id = str(payload.get("device_id", "pi1"))
     raw_cred = str(payload.get("credential", ""))
     cred_hash = hash_credential(raw_cred)
 
@@ -129,11 +164,34 @@ def _handle_access_request(payload: dict):
         {"device_id": device_id, "granted": granted},
     )
 
+    # Fysisk brute-force detektion (3 afviste forsøg inden for 60 sek -> alarm!)
+    now = time.time()
+    if granted:
+        _failed_access_attempts[device_id].clear()
+    else:
+        recent = [t for t in _failed_access_attempts[device_id] if now - t <= DOOR_BRUTEFORCE_WINDOW_SEC]
+        recent.append(now)
+        _failed_access_attempts[device_id] = recent
+        if len(recent) >= DOOR_BRUTEFORCE_LIMIT:
+            _failed_access_attempts[device_id].clear()
+            log_system(
+                "access_control",
+                "ERROR",
+                f"BRUTE-FORCE ALARM: {DOOR_BRUTEFORCE_LIMIT} afviste adgangsforsøg ved {device_id} inden for {DOOR_BRUTEFORCE_WINDOW_SEC}s!",
+                {"device_id": device_id},
+            )
+            publish_command(
+                device_id,
+                "alarm_test",
+                {"seconds": 5, "reason": "door_bruteforce"},
+                issued_by="security_watchdog",
+            )
+
 
 def _on_connect(client, userdata, flags, reason_code, properties):
     global _connected
     _connected = (reason_code == 0)
-    print(f"[MQTT] Connected rc={reason_code}")
+    print(f"[MQTT] Connected rc={reason_code}", flush=True)
     client.subscribe("serverroom/#", qos=1)
     log_system("mqtt_worker", "INFO", "Backend forbundet til Mosquitto MQTT-broker")
 
@@ -141,7 +199,7 @@ def _on_connect(client, userdata, flags, reason_code, properties):
 def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
     global _connected
     _connected = False
-    print(f"[MQTT] Disconnected rc={reason_code}")
+    print(f"[MQTT] Disconnected rc={reason_code}", flush=True)
 
 
 def _on_message(client, userdata, msg):
@@ -179,7 +237,38 @@ def _heartbeat_watchdog():
                         cur.execute("UPDATE device_status SET status = 'offline' WHERE device_id = %s", (dev,))
                         log_system("watchdog", "ERROR", f"Timeout: ingen data fra '{dev}' i over 60 sek.")
         except Exception as e:
-            print(f"[watchdog error] {e}")
+            print(f"[watchdog error] {e}", flush=True)
+
+
+def run_gdpr_retention():
+    """GDPR-dataminimering: sletter forældede sensormålinger og personhenførbare adgangslogs."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM sensor_readings WHERE time < NOW() - INTERVAL %s DAY",
+                    (RETENTION_SENSOR_DAYS,),
+                )
+                del_s = cur.rowcount
+                cur.execute(
+                    "DELETE FROM access_logs WHERE time < NOW() - INTERVAL %s DAY",
+                    (RETENTION_ACCESS_DAYS,),
+                )
+                del_a = cur.rowcount
+        if del_s or del_a:
+            log_system(
+                "gdpr_retention",
+                "INFO",
+                f"GDPR-oprydning: slettede {del_s} målinger (>{RETENTION_SENSOR_DAYS}d) og {del_a} adgangslogs (>{RETENTION_ACCESS_DAYS}d)",
+            )
+    except Exception as e:
+        print(f"[gdpr_retention error] {e}", flush=True)
+
+
+def _retention_loop():
+    while True:
+        time.sleep(3600)
+        run_gdpr_retention()
 
 
 def start_mqtt():
@@ -193,8 +282,8 @@ def start_mqtt():
     _client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=30)
     _client.loop_start()
 
-    t = threading.Thread(target=_heartbeat_watchdog, daemon=True)
-    t.start()
+    threading.Thread(target=_heartbeat_watchdog, daemon=True).start()
+    threading.Thread(target=_retention_loop, daemon=True).start()
 
 
 def mqtt_is_connected() -> bool:

@@ -142,6 +142,7 @@
             <button class="sec" onclick="sendCmd('fan_off', {})">⏹️ Sluk blæser</button>
             <button class="danger" onclick="sendCmd('alarm_test', {seconds:3})">🚨 Test alarm</button>
             <button class="sec" onclick="sendCmd('ping', {})">📡 Ping Pi</button>
+            <button id="btn-auto" class="success" onclick="toggleAuto()">🤖 AI Auto-køling: TIL</button>
           </div>
           <div class="scroll">
             <table>
@@ -153,6 +154,7 @@
 
         <div class="card">
           <h2>🩺 Driftstatus &amp; Enheder (Heartbeat / LWT)</h2>
+          <div id="srv-metrics" class="pills" style="margin-bottom:10px"><span class="pill">Azure CPU/RAM indlæser...</span></div>
           <div class="scroll">
             <table>
               <thead><tr><th>Enhed</th><th>Status</th><th>Sidst set</th></tr></thead>
@@ -290,6 +292,20 @@
         pd.textContent = "MariaDB: " + (d.health.db ? "ONLINE" : "OFFLINE");
         pd.className = "pill " + (d.health.db ? "ok" : "err");
         document.getElementById("p-upd").textContent = "Opdateret " + new Date().toLocaleTimeString("da-DK");
+        if (d.server_metrics) {
+          const m = d.server_metrics;
+          document.getElementById("srv-metrics").innerHTML =
+            `<span class="pill ok">Azure Load: ${esc(m.cpu_load)}</span>` +
+            `<span class="pill ${m.ram_pct>85?'warn':'ok'}">RAM: ${esc(m.ram_pct)}%</span>` +
+            `<span class="pill ${m.disk_pct>85?'warn':'ok'}">Disk: ${esc(m.disk_pct)}%</span>` +
+            `<span class="pill">Uptime: ${esc(m.uptime)}</span>`;
+        }
+        if (d.settings) {
+          window._autoCool = !!d.settings.auto_cooling;
+          const b = document.getElementById("btn-auto");
+          b.textContent = "🤖 AI Auto-køling: " + (window._autoCool ? "TIL" : "FRA");
+          b.className = window._autoCool ? "success" : "sec";
+        }
 
         if (d.readings.length) {
           const last = d.readings[d.readings.length - 1];
@@ -346,6 +362,13 @@
           return `<tr><td>${esc(l.time)}</td><td>${esc(l.source)}</td><td><span class="pill ${cls}">${esc(l.level)}</span></td><td>${esc(l.message)}</td></tr>`;
         }).join("");
       } catch (e) {}
+    }
+
+    async function toggleAuto() {
+      const next = !window._autoCool;
+      await api("/api/settings/auto-cooling", { method: "POST", body: JSON.stringify({ enabled: next }) });
+      showToast("Autonom AI-køling: " + (next ? "TIL" : "FRA"));
+      refresh();
     }
 
     async function sendCmd(command, payload) {

@@ -19,3 +19,4 @@ venv/
 *.docx
 *.pdf
 mosquitto/config/acl
+backups/

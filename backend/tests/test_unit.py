@@ -189,3 +189,47 @@ class TestMqttResilience(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestHardeningAndAutomation(unittest.TestCase):
+    def test_flatline_sensor_defect_detected(self):
+        base_ts = int(time.time())
+        stuck_rows = [
+            {"ts": base_ts - i * 5, "temperature": 22.0, "humidity": 45.0, "noise_db": 50.0}
+            for i in range(25)
+        ]
+        conn, _ = make_mock_conn(fetchall_val=stuck_rows)
+        with patch("ai_engine.get_conn", return_value=conn):
+            res = ai_engine.analyze_reading("pi1", 22.0, 45.0, 50.0)
+        self.assertTrue(res["is_anomaly"])
+        self.assertTrue(any("flatline" in r.lower() for r in res["reasons"]))
+
+    def test_door_bruteforce_triggers_alarm_after_3_failures(self):
+        mqtt_worker._failed_access_attempts.clear()
+        conn, _ = make_mock_conn(fetchone_val=None)
+        mock_client = MagicMock()
+        with patch("mqtt_worker.get_conn", return_value=conn), \
+             patch("mqtt_worker._client", mock_client), \
+             patch("mqtt_worker.log_system"), \
+             patch("mqtt_worker.publish_command") as mock_pub:
+            for _ in range(3):
+                mqtt_worker._handle_access_request({"device_id": "door1", "credential": "FORKERT"})
+            mock_pub.assert_called_once()
+            self.assertEqual(mock_pub.call_args[0][1], "alarm_test")
+
+    def test_ai_autopilot_sends_fan_on_on_critical_temp(self):
+        mqtt_worker._last_auto_action_ts.clear()
+        mqtt_worker.set_auto_cooling(True)
+        conn, _ = make_mock_conn(fetchall_val=[])
+        with patch("mqtt_worker.get_conn", return_value=conn), \
+             patch("mqtt_worker.update_device_status"), \
+             patch("mqtt_worker.analyze_reading", return_value={"critical_action_needed": True}), \
+             patch("mqtt_worker.publish_command") as mock_pub:
+            mqtt_worker._handle_telemetry("pi1", {"temperature": 29.0, "humidity": 45.0, "noise_db": 55.0})
+            mock_pub.assert_called_once()
+            self.assertEqual(mock_pub.call_args[0][1], "fan_on")
+
+    def test_server_metrics_returns_valid_fields(self):
+        m = main.get_server_metrics()
+        for k in ("cpu_load", "ram_pct", "disk_pct", "uptime"):
+            self.assertIn(k, m)
