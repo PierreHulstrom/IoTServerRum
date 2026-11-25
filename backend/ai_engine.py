@@ -44,18 +44,31 @@ def analyze_reading(device_id: str, temp, hum, noise):
             )
             rows = cur.fetchall()
 
-    # 3. Isolation Forest anomaly detection (kræver min. 20 målinger)
+    # 3. Hybrid ML (Isolation Forest + Robust Z-score mod stabil baseline)
     if len(rows) >= 20 and None not in (temp, hum, noise):
-        X = np.array([[r["temperature"], r["humidity"], r["noise_db"]] for r in rows])
+        # Ekskludér nyeste række hvis >20 rækker, så en ny outlier ikke forurener sin egen baseline
+        hist = rows[1:] if len(rows) > 20 else rows
+        X = np.array([[r["temperature"], r["humidity"], r["noise_db"]] for r in hist], dtype=float)
+        current = np.array([[temp, hum, noise]], dtype=float)
+
+        # 3A: Robust multivariat Z-score (fanger spring selv ved helt flad/stabil baseline)
+        means = np.mean(X, axis=0)
+        stds = np.maximum(np.std(X, axis=0), np.array([0.5, 1.5, 2.0]))
+        max_z = float(np.max(np.abs((current[0] - means) / stds)))
+        if max_z >= 4.0:
+            is_anomaly = True
+            anomaly_score = round(max_z, 2)
+            reasons.append(f"AI Z-score afvigelse (z={max_z:.1f})")
+
+        # 3B: Unsupervised Isolation Forest (fanger komplekse mønster-afvigelser)
         model = IsolationForest(contamination=0.05, random_state=42)
         model.fit(X)
-        current = np.array([[temp, hum, noise]])
         pred = int(model.predict(current)[0])       # -1 = anomaly, 1 = normal
-        score = float(-model.decision_function(current)[0])
-        anomaly_score = round(score, 4)
+        iso_score = float(-model.decision_function(current)[0])
         if pred == -1:
             is_anomaly = True
-            reasons.append(f"AI Isolation Forest afvigelse (score={anomaly_score:.3f})")
+            anomaly_score = max(anomaly_score, round(iso_score, 4))
+            reasons.append(f"AI Isolation Forest afvigelse (score={iso_score:.3f})")
 
     # 4. Trend-forudsigelse (kræver reel stigning >= 0.8 °C over min. 45 sek, output i hele minutter)
     recent = list(reversed(rows[:15]))
