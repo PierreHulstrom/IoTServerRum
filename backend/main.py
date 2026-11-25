@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import json
 import os
-import secrets
 import shutil
 import time
 from collections import defaultdict
@@ -13,6 +12,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from auth_utils import (
+    VALID_ROLES,
+    authenticate_user,
+    bootstrap_admin,
+    upsert_user,
+)
 from db import db_ping, get_conn
 from mqtt_worker import (
     get_auto_cooling,
@@ -82,16 +87,18 @@ def get_server_metrics() -> dict:
     }
 
 
-def create_token(username: str) -> str:
+def create_token(username: str, role: str = "admin") -> str:
     if not SECRET_KEY:
         raise RuntimeError("DASHBOARD_SECRET_KEY mangler i .env")
-    payload = json.dumps({"sub": username, "exp": int(time.time()) + TOKEN_TTL_SEC}).encode("utf-8")
+    payload = json.dumps(
+        {"sub": username, "role": role, "exp": int(time.time()) + TOKEN_TTL_SEC}
+    ).encode("utf-8")
     b64 = base64.urlsafe_b64encode(payload).decode("utf-8")
     sig = hmac.new(SECRET_KEY, b64.encode("utf-8"), hashlib.sha256).hexdigest()
     return f"{b64}.{sig}"
 
 
-def verify_token(authorization: str | None = Header(default=None)) -> str:
+def verify_session(authorization: str | None = Header(default=None)) -> dict:
     if not SECRET_KEY:
         raise HTTPException(status_code=500, detail="Server-konfigurationsfejl")
     if not authorization or not authorization.startswith("Bearer "):
@@ -105,19 +112,32 @@ def verify_token(authorization: str | None = Header(default=None)) -> str:
         data = json.loads(base64.urlsafe_b64decode(b64.encode("utf-8")).decode("utf-8"))
         if data.get("exp", 0) < time.time():
             raise HTTPException(status_code=401, detail="Session udløbet")
-        return str(data.get("sub", "admin"))
+        return {"username": str(data.get("sub", "admin")), "role": str(data.get("role", "admin"))}
     except HTTPException:
         raise
     except Exception:
         raise HTTPException(status_code=401, detail="Ugyldigt token")
 
 
+def verify_token(authorization: str | None = Header(default=None)) -> str:
+    return verify_session(authorization)["username"]
+
+
+def require_role(*allowed_roles: str):
+    def _dep(session: dict = Depends(verify_session)) -> dict:
+        if session["role"] not in allowed_roles:
+            raise HTTPException(status_code=403, detail=f"Manglende rettighed (rolle: {session['role']})")
+        return session
+    return _dep
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not DASHBOARD_PASS or not SECRET_KEY:
         raise RuntimeError("DASHBOARD_PASS og DASHBOARD_SECRET_KEY SKAL være sat i .env!")
+    bootstrap_admin(DASHBOARD_USER, DASHBOARD_PASS)
     start_mqtt()
-    log_system("backend", "INFO", "FastAPI backend startet (hærdet konfiguration)")
+    log_system("backend", "INFO", "FastAPI backend startet (PBKDF2 RBAC + hærdet konfiguration)")
     yield
 
 
@@ -146,6 +166,12 @@ class AutoCoolingReq(BaseModel):
     enabled: bool
 
 
+class UserCreateReq(BaseModel):
+    username: str
+    password: str
+    role: str = "admin"
+
+
 @app.get("/")
 def serve_dashboard():
     return FileResponse("static/index.html")
@@ -158,34 +184,38 @@ def health():
 
 @app.post("/api/login")
 def login(req: LoginReq, request: Request):
-    if not DASHBOARD_PASS or not SECRET_KEY:
+    if not SECRET_KEY:
         raise HTTPException(status_code=500, detail="Auth ikke konfigureret")
 
     client_ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     if not client_ip:
         client_ip = request.client.host if request.client else "unknown"
 
+    rate_key = f"{client_ip}:{req.username.strip().lower()}"
     now = time.time()
-    recent = [t for t in _login_failures[client_ip] if now - t <= LOGIN_WINDOW_SEC]
-    _login_failures[client_ip] = recent
+    recent = [t for t in _login_failures[rate_key] if now - t <= LOGIN_WINDOW_SEC]
+    _login_failures[rate_key] = recent
     if len(recent) >= LOGIN_MAX_ATTEMPTS:
-        log_system("auth", "WARNING", f"Rate-limit blokerede login fra {client_ip} (429)")
+        log_system("auth", "WARNING", f"Rate-limit blokerede '{req.username}' fra {client_ip} (429)")
         raise HTTPException(status_code=429, detail="For mange fejlede forsøg – prøv igen om 5 min")
 
-    ok_user = secrets.compare_digest(req.username, DASHBOARD_USER)
-    ok_pass = secrets.compare_digest(req.password, DASHBOARD_PASS)
-    if not (ok_user and ok_pass):
-        _login_failures[client_ip].append(now)
+    user = authenticate_user(req.username, req.password)
+    if not user:
+        _login_failures[rate_key].append(now)
         log_system("auth", "WARNING", f"Fejlet login-forsøg for '{req.username}' fra {client_ip}")
         raise HTTPException(status_code=401, detail="Forkert brugernavn eller kodeord")
 
-    _login_failures[client_ip].clear()
-    log_system("auth", "INFO", f"Bruger '{req.username}' loggede ind på dashboard")
-    return {"token": create_token(req.username), "username": req.username}
+    _login_failures[rate_key].clear()
+    log_system("auth", "INFO", f"Bruger '{user['username']}' ({user['role']}) loggede ind på dashboard")
+    return {
+        "token": create_token(user["username"], user["role"]),
+        "username": user["username"],
+        "role": user["role"],
+    }
 
 
 @app.get("/api/overview")
-def overview(user: str = Depends(verify_token)):
+def overview(session: dict = Depends(verify_session)):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -253,7 +283,19 @@ def overview(user: str = Depends(verify_token)):
             )
             commands = cur.fetchall()
 
+            users = []
+            if session["role"] == "admin":
+                cur.execute(
+                    """
+                    SELECT id, username, role, is_active,
+                           DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS created_at
+                    FROM dashboard_users ORDER BY id ASC
+                    """
+                )
+                users = cur.fetchall()
+
     return {
+        "current_user": session,
         "health": {"db": db_ping(), "mqtt": mqtt_is_connected()},
         "server_metrics": get_server_metrics(),
         "settings": {"auto_cooling": get_auto_cooling()},
@@ -264,23 +306,24 @@ def overview(user: str = Depends(verify_token)):
         "access_logs": access_logs,
         "system_logs": system_logs,
         "commands": commands,
+        "users": users,
     }
 
 
 @app.post("/api/settings/auto-cooling")
-def toggle_auto_cooling(req: AutoCoolingReq, user: str = Depends(verify_token)):
+def toggle_auto_cooling(req: AutoCoolingReq, session: dict = Depends(require_role("admin", "operator"))):
     state = set_auto_cooling(req.enabled)
-    log_system("ai_autopilot", "INFO", f"Autonom AI-køling sat til {'TIL' if state else 'FRA'} af {user}")
+    log_system("ai_autopilot", "INFO", f"Autonom AI-køling sat til {'TIL' if state else 'FRA'} af {session['username']}")
     return {"auto_cooling": state}
 
 
 @app.post("/api/command")
-def send_command(req: CommandReq, user: str = Depends(verify_token)):
-    return publish_command(req.device_id, req.command, req.payload, issued_by=user)
+def send_command(req: CommandReq, session: dict = Depends(require_role("admin", "operator"))):
+    return publish_command(req.device_id, req.command, req.payload, issued_by=session["username"])
 
 
 @app.post("/api/access/cards")
-def add_card(req: CardReq, user: str = Depends(verify_token)):
+def add_card(req: CardReq, session: dict = Depends(require_role("admin", "operator"))):
     if len(req.credential.strip()) < 3:
         raise HTTPException(status_code=400, detail="Kort-UID/PIN skal være mindst 3 tegn")
     cred_hash = hash_credential(req.credential)
@@ -293,23 +336,64 @@ def add_card(req: CardReq, user: str = Depends(verify_token)):
                 )
     except Exception:
         raise HTTPException(status_code=409, detail="Kort/PIN findes allerede i systemet")
-    log_system("access_control", "INFO", f"Nyt adgangskort oprettet til '{req.owner_name}' af {user}")
+    log_system("access_control", "INFO", f"Nyt adgangskort oprettet til '{req.owner_name}' af {session['username']}")
     return {"status": "created"}
 
 
 @app.patch("/api/access/cards/{card_id}/toggle")
-def toggle_card(card_id: int, user: str = Depends(verify_token)):
+def toggle_card(card_id: int, session: dict = Depends(require_role("admin", "operator"))):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE access_cards SET is_active = NOT is_active WHERE id = %s", (card_id,))
-    log_system("access_control", "INFO", f"Status ændret på adgangskort #{card_id} af {user}")
+    log_system("access_control", "INFO", f"Status ændret på adgangskort #{card_id} af {session['username']}")
     return {"status": "updated"}
 
 
 @app.delete("/api/access/cards/{card_id}")
-def delete_card(card_id: int, user: str = Depends(verify_token)):
+def delete_card(card_id: int, session: dict = Depends(require_role("admin", "operator"))):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM access_cards WHERE id = %s", (card_id,))
-    log_system("access_control", "WARNING", f"Adgangskort #{card_id} slettet af {user}")
+    log_system("access_control", "WARNING", f"Adgangskort #{card_id} slettet af {session['username']}")
+    return {"status": "deleted"}
+
+
+@app.post("/api/users")
+def create_dashboard_user(req: UserCreateReq, session: dict = Depends(require_role("admin"))):
+    if len(req.username.strip()) < 2 or len(req.password) < 8:
+        raise HTTPException(status_code=400, detail="Brugernavn >= 2 tegn og kodeord >= 8 tegn")
+    if req.role.strip().lower() not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail="Ugyldig rolle (brug admin, operator eller viewer)")
+    upsert_user(req.username, req.password, role=req.role)
+    log_system("auth", "INFO", f"Dashboard-bruger '{req.username.lower()}' ({req.role}) oprettet/opdateret af {session['username']}")
+    return {"status": "saved"}
+
+
+@app.patch("/api/users/{user_id}/toggle")
+def toggle_dashboard_user(user_id: int, session: dict = Depends(require_role("admin"))):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username FROM dashboard_users WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Bruger ikke fundet")
+            if row["username"] == session["username"]:
+                raise HTTPException(status_code=400, detail="Du kan ikke spærre din egen bruger")
+            cur.execute("UPDATE dashboard_users SET is_active = NOT is_active WHERE id = %s", (user_id,))
+    log_system("auth", "WARNING", f"Status ændret på bruger '{row['username']}' af {session['username']}")
+    return {"status": "updated"}
+
+
+@app.delete("/api/users/{user_id}")
+def delete_dashboard_user(user_id: int, session: dict = Depends(require_role("admin"))):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT username FROM dashboard_users WHERE id = %s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Bruger ikke fundet")
+            if row["username"] == session["username"]:
+                raise HTTPException(status_code=400, detail="Du kan ikke slette din egen bruger")
+            cur.execute("DELETE FROM dashboard_users WHERE id = %s", (user_id,))
+    log_system("auth", "WARNING", f"Bruger '{row['username']}' slettet af {session['username']}")
     return {"status": "deleted"}

@@ -88,6 +88,7 @@
       <div class="pills">
         <span id="p-mqtt" class="pill">MQTT: ...</span>
         <span id="p-db" class="pill">MariaDB: ...</span>
+        <span id="p-user" class="pill">👤 ...</span>
         <span id="p-upd" class="pill">Opdaterer...</span>
         <button class="sec" onclick="logout()">Log ud</button>
       </div>
@@ -205,6 +206,26 @@
           </div>
         </div>
       </section>
+
+      <section id="admin-users-sec" class="card hidden">
+        <h2>👥 Dashboard-brugere &amp; RBAC (PBKDF2-SHA256)</h2>
+        <form class="form-inline" onsubmit="addDashUser(event)">
+          <input id="du-name" placeholder="Brugernavn (fx andrew)" required />
+          <input id="du-pass" type="password" placeholder="Kodeord (min. 8 tegn)" minlength="8" required />
+          <select id="du-role">
+            <option value="admin">admin (fuld adgang)</option>
+            <option value="operator">operator (fjernstyring)</option>
+            <option value="viewer">viewer (kun læse / censor)</option>
+          </select>
+          <button type="submit">+ Gem bruger</button>
+        </form>
+        <div class="scroll">
+          <table>
+            <thead><tr><th>Brugernavn</th><th>Rolle</th><th>Status</th><th>Oprettet</th><th>Handling</th></tr></thead>
+            <tbody id="t-users"></tbody>
+          </table>
+        </div>
+      </section>
     </main>
   </div>
 
@@ -242,7 +263,10 @@
           body: JSON.stringify({ username: u.value, password: p.value }),
         });
         if (!res.ok) {
-          document.getElementById("login-err").textContent = "Forkert brugernavn eller kodeord";
+          document.getElementById("login-err").textContent =
+            res.status === 429
+              ? "🚫 For mange fejlede forsøg – blokeret i 5 min (HTTP 429)"
+              : "Forkert brugernavn eller kodeord";
           return;
         }
         const data = await res.json();
@@ -292,6 +316,22 @@
         pd.textContent = "MariaDB: " + (d.health.db ? "ONLINE" : "OFFLINE");
         pd.className = "pill " + (d.health.db ? "ok" : "err");
         document.getElementById("p-upd").textContent = "Opdateret " + new Date().toLocaleTimeString("da-DK");
+        if (d.current_user) {
+          document.getElementById("p-user").textContent = `👤 ${d.current_user.username} (${d.current_user.role})`;
+          const sec = document.getElementById("admin-users-sec");
+          if (d.current_user.role === "admin") {
+            sec.classList.remove("hidden");
+            document.getElementById("t-users").innerHTML = (d.users || []).map(u =>
+              `<tr><td>${esc(u.username)}</td><td><span class="pill">${esc(u.role)}</span></td>
+               <td><span class="pill ${u.is_active?'ok':'err'}">${u.is_active?'Aktiv':'Spærret'}</span></td>
+               <td>${esc(u.created_at)}</td>
+               <td><button class="sec" style="padding:4px 8px" onclick="toggleUser(${u.id})">Skift</button>
+               <button class="danger" style="padding:4px 8px" onclick="delUser(${u.id})">Slet</button></td></tr>`
+            ).join("");
+          } else {
+            sec.classList.add("hidden");
+          }
+        }
         if (d.server_metrics) {
           const m = d.server_metrics;
           document.getElementById("srv-metrics").innerHTML =
@@ -396,6 +436,30 @@
 
     async function toggleCard(id) {
       await api(`/api/access/cards/${id}/toggle`, { method: "PATCH" });
+      refresh();
+    }
+
+    async function addDashUser(e) {
+      e.preventDefault();
+      await api("/api/users", {
+        method: "POST",
+        body: JSON.stringify({
+          username: document.getElementById("du-name").value,
+          password: document.getElementById("du-pass").value,
+          role: document.getElementById("du-role").value
+        })
+      });
+      document.getElementById("du-name").value = "";
+      document.getElementById("du-pass").value = "";
+      showToast("Dashboard-bruger gemt (PBKDF2-SHA256)");
+      refresh();
+    }
+    async function toggleUser(id) {
+      await api(`/api/users/${id}/toggle`, { method: "PATCH" });
+      refresh();
+    }
+    async function delUser(id) {
+      await api(`/api/users/${id}`, { method: "DELETE" });
       refresh();
     }
 
