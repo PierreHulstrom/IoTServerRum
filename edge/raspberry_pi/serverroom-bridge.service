@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 User=kongerne
 WorkingDirectory=/home/kongerne/IoTServerRum/edge/raspberry_pi
-ExecStart=/home/kongerne/IoTServerRum/edge/raspberry_pi/.venv/bin/python3 pi_agent.py --serial /dev/ttyACM0
+ExecStart=/home/kongerne/IoTServerRum/edge/raspberry_pi/.venv/bin/python3 pi_agent.py --serial auto
 Restart=always
 RestartSec=5
 

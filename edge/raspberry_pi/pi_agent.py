@@ -1,4 +1,5 @@
 import argparse
+import glob
 import json
 import os
 import random
@@ -30,7 +31,7 @@ MQTT_USER = os.getenv("MQTT_USER", "pi-node")
 MQTT_PASS = os.getenv("MQTT_PASS", "")
 DEVICE_ID = os.getenv("DEVICE_ID", "pi1")
 ZONE = os.getenv("ZONE", "rack1")
-SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/ttyACM0")
+SERIAL_PORT = os.getenv("SERIAL_PORT", "auto")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 
 
@@ -189,12 +190,23 @@ class PiBridge:
                 )
                 self._flush_buffer()
 
+    def _detect_serial_port(self):
+        if self.serial_port and self.serial_port != "auto" and os.path.exists(self.serial_port):
+            return self.serial_port
+        candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
+        return candidates[0] if candidates else None
+
     def _serial_loop(self):
         import serial
         while True:
+            port = self._detect_serial_port()
+            if not port:
+                print("[SERIAL] Ingen Arduino/Elegoo USB-enhed fundet (/dev/ttyACM* eller /dev/ttyUSB*) – prøver igen om 5 sek...", flush=True)
+                time.sleep(5)
+                continue
             try:
-                print(f"[SERIAL] Åbner {self.serial_port} @ {self.baud} baud...")
-                self.ser = serial.Serial(self.serial_port, self.baud, timeout=1)
+                print(f"[SERIAL] Åbner {port} @ {self.baud} baud...", flush=True)
+                self.ser = serial.Serial(port, self.baud, timeout=1)
                 time.sleep(2)
                 print("[SERIAL] Forbundet til Arduino!")
                 while True:
