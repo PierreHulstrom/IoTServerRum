@@ -175,8 +175,9 @@ void handleIncomingCommand(const String &line) {
     openDoorNonBlocking("Remote Unlocked", "Serverroom open", 8000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_unlock\"}");
   } else if (line.indexOf("\"lock_door\"") >= 0) {
-    tone(buzzerPin, 600, 150);
     resetToLocked();
+    tone(buzzerPin, 900, 200);
+    showTempStatus("Door Locked", "By Azure Admin", 2000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_lock\"}");
   } else if (line.indexOf("\"fan_on\"") >= 0) {
     tone(buzzerPin, 1400, 120);
