@@ -127,12 +127,21 @@ class PiBridge:
 
     def _send_to_arduino(self, obj: dict):
         line = json.dumps(obj, separators=(",", ":")) + "\n"
-        if self.ser and self.ser.is_open:
-            self.ser.write(line.encode("utf-8"))
-            self.ser.flush()
-            print(f"[PI -> ARDUINO] {line.strip()}", flush=True)
-        else:
-            print(f"[SIMULERET ARDUINO] Udfører: {line.strip()}")
+        try:
+            if self.ser and self.ser.is_open:
+                self.ser.write(line.encode("utf-8"))
+                self.ser.flush()
+                print(f"[PI -> ARDUINO] {line.strip()}", flush=True)
+            else:
+                print(f"[SIMULERET/OFFLINE ARDUINO] {line.strip()}", flush=True)
+        except Exception as e:
+            print(f"[SERIAL WRITE FEJL] Ignoreret (USB frakoblet?): {e}", flush=True)
+            try:
+                if self.ser:
+                    self.ser.close()
+            except Exception:
+                pass
+            self.ser = None
 
     def _publish_now(self, topic: str, payload_obj: dict, retain=False):
         payload = json.dumps(payload_obj)
