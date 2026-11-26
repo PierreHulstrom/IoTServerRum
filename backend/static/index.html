@@ -155,6 +155,12 @@
             <button onclick="sendCmd('fan_on', {})">Tænd blæser</button>
             <button class="sec" onclick="sendCmd('fan_off', {})">Sluk blæser</button>
             <button class="danger" onclick="sendCmd('alarm_test', {seconds:3})">Test alarm</button>
+          </div>
+          <form class="form-inline" onsubmit="disarmAlarm(event)">
+            <input id="disarm-pass" type="password" placeholder="Dit login-kodeord for at afstille alarm" style="flex:1;min-width:220px" required />
+            <button type="submit" class="success">Afstil alarm</button>
+          </form>
+          <div class="btn-row">
             <button class="sec" onclick="sendCmd('ping', {})">Ping enhed</button>
             <button class="sec" onclick="sendCmd('reset_state', {})">Nulstil enhed</button>
             <button id="btn-auto" class="success" onclick="toggleAuto()">AI Auto-køling: TIL</button>
@@ -426,6 +432,28 @@
           return `<tr><td>${esc(l.time)}</td><td>${esc(l.source)}</td><td><span class="pill ${cls}">${esc(l.level)}</span></td><td>${esc(l.message)}</td></tr>`;
         }).join("");
       } catch (e) {}
+    }
+
+    async function disarmAlarm(e) {
+      e.preventDefault();
+      const device_id = document.getElementById("cmd-dev").value.trim() || "pi1";
+      const pw = document.getElementById("disarm-pass").value;
+      const res = await fetch("/api/alarm/disarm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + token },
+        body: JSON.stringify({ device_id, password: pw })
+      });
+      if (res.status === 401) {
+        showToast("Forkert kodeord – alarmen kører videre!");
+        return;
+      }
+      if (!res.ok) {
+        showToast("Kunne ikke afstille alarm (manglende rettighed)");
+        return;
+      }
+      document.getElementById("disarm-pass").value = "";
+      showToast("Alarm afstillet på " + device_id);
+      refresh();
     }
 
     async function toggleAuto() {

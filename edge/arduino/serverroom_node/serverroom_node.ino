@@ -1,5 +1,5 @@
 /* =========================================================================
- * Serverrum IoT – Elegoo / Arduino Mega 2560 (Azure + Pi + Lokal 2FA)
+ * Serverrum IoT – Elegoo / Arduino Mega 2560 (Azure + Pi + Lokal 2FA + Vedvarende Alarm)
  * ========================================================================= */
 #include <Keypad.h>
 #include <dhtnew.h>
@@ -9,19 +9,15 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-/* =========================================================================
- * Hardware & Sensorer (Holdets fysiske pins – nul konflikter!)
- * ========================================================================= */
+// Holdets fysiske pins (RC522 RST på Pin 5 – nul konflikt med LCD ben 6-11)
 #define RST_PIN 5
 #define SS_PIN  53
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
 byte gyldigUID[] = { 0xF1, 0xEF, 0xBE, 0x53 };
 
-// DHT22 Sensor (Digital Pin 48)
+// DHT22 (Pin 48) & Lydsensor (A0)
 DHTNEW mySensor(48);
-
-// Lydsensor (Analog udgang A0)
 const int soundAnalogPin = A0;
 const int sampleWindow = 50;
 unsigned long previousSensorMillis = 0;
@@ -49,22 +45,27 @@ byte rowPins[ROWS] = {31, 33, 35, 37};
 byte colPins[COLS] = {39, 41, 43, 45};
 Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
 
-// DS3231 RTC-modul (I2C: Pin 20/21)
 RTC_DS3231 rtc;
 bool rtcOk = false;
 
-// Tilstand og pinkode
+// Tilstande
 bool kortGodkendt = false;
 String indtastetKode = "";
 String korrektKode = "1984";
 String senesteUID = "";
-
 int wrongAttempts = 0;
 const int maxAttempts = 3;
 
 bool doorIsOpen = false;
 unsigned long doorOpenUntil = 0;
 unsigned long tempMsgUntil = 0;
+
+// Non-blocking vedvarende alarm (stopper KUN ved PIN 1984# eller Azure alarm_stop!)
+bool alarmActive = false;
+unsigned long lastSirenToggleMs = 0;
+bool sirenHigh = false;
+String alarmPinBuf = "";
+
 String serialBuf = "";
 
 // --- HJÆLPEFUNKTIONER ---
@@ -114,6 +115,8 @@ void showTempStatus(const String &l1, const String &l2, unsigned long ms) {
 }
 
 void resetToLocked() {
+  alarmActive = false;
+  alarmPinBuf = "";
   noTone(buzzerPin);
   doorIsOpen = false;
   kortGodkendt = false;
@@ -124,6 +127,44 @@ void resetToLocked() {
   visStartSkaerm();
 }
 
+void startPersistentAlarm(const String &subtext) {
+  alarmActive = true;
+  alarmPinBuf = "";
+  doorIsOpen = false;
+  kortGodkendt = false;
+  indtastetKode = "";
+  tempMsgUntil = 0;
+  digitalWrite(ledPinG, LOW);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("ALARM ACTIVE!");
+  lcd.setCursor(0, 1);
+  lcd.print(subtext.substring(0, 16));
+}
+
+void disarmLocalAlarm(const String &who) {
+  alarmActive = false;
+  alarmPinBuf = "";
+  wrongAttempts = 0;
+  noTone(buzzerPin);
+  digitalWrite(ledPinG, LOW);
+  digitalWrite(ledPinR, HIGH);
+  tone(buzzerPin, 1800, 150);
+  showTempStatus("Alarm Disarmed", who, 2500);
+  Serial.println("{\"type\":\"access_event\",\"event\":\"alarm_disarmed\"}");
+}
+
+void updateAlarmSiren(unsigned long nowMs) {
+  if (!alarmActive) return;
+  maxPeakInInterval = 0; // Ignorér egen sirene på lydsensoren!
+  if (nowMs - lastSirenToggleMs >= 220) {
+    lastSirenToggleMs = nowMs;
+    sirenHigh = !sirenHigh;
+    tone(buzzerPin, sirenHigh ? 2200 : 1200);
+    digitalWrite(ledPinR, sirenHigh ? HIGH : LOW);
+  }
+}
+
 bool tjekUID() {
   if (mfrc522.uid.size != 4) return false;
   for (byte i = 0; i < 4; i++) {
@@ -132,26 +173,9 @@ bool tjekUID() {
   return true;
 }
 
-void triggerSiren(int loops) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("ALARM: LOCKED!");
-  for (int alarmLoop = 0; alarmLoop < loops; alarmLoop++) {
-    for (int hz = 1000; hz <= 2500; hz += 100) {
-      tone(buzzerPin, hz);
-      digitalWrite(ledPinR, HIGH);
-      delay(25);
-    }
-    for (int hz = 2500; hz >= 1000; hz -= 100) {
-      tone(buzzerPin, hz);
-      digitalWrite(ledPinR, LOW);
-      delay(25);
-    }
-  }
-  resetToLocked();
-}
-
 void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
+  alarmActive = false;
+  alarmPinBuf = "";
   noTone(buzzerPin);
   digitalWrite(ledPinR, LOW);
   digitalWrite(ledPinG, HIGH);
@@ -171,7 +195,11 @@ void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
 
 // --- MODTAG FJERNSTYRING FRA AZURE -> PI ---
 void handleIncomingCommand(const String &line) {
-  if (line.indexOf("\"unlock_door\"") >= 0) {
+  if (line.indexOf("\"alarm_stop\"") >= 0) {
+    disarmLocalAlarm("By Azure Auth");
+  } else if (line.indexOf("\"alarm_test\"") >= 0) {
+    startPersistentAlarm("Code/Azure Stop");
+  } else if (line.indexOf("\"unlock_door\"") >= 0) {
     openDoorNonBlocking("Remote Unlocked", "Serverroom open", 8000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_unlock\"}");
   } else if (line.indexOf("\"lock_door\"") >= 0) {
@@ -180,16 +208,20 @@ void handleIncomingCommand(const String &line) {
     showTempStatus("Door Locked", "By Azure Admin", 2000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_lock\"}");
   } else if (line.indexOf("\"fan_on\"") >= 0) {
-    tone(buzzerPin, 1400, 120);
-    showTempStatus("Cooling: ON", "Azure / AI Auto", 3000);
+    if (!alarmActive) {
+      tone(buzzerPin, 1400, 120);
+      showTempStatus("Cooling: ON", "Azure / AI Auto", 3000);
+    }
   } else if (line.indexOf("\"fan_off\"") >= 0) {
-    tone(buzzerPin, 900, 120);
-    showTempStatus("Cooling: OFF", "Normal mode", 3000);
-  } else if (line.indexOf("\"alarm_test\"") >= 0) {
-    triggerSiren(6);
+    if (!alarmActive) {
+      tone(buzzerPin, 900, 120);
+      showTempStatus("Cooling: OFF", "Normal mode", 3000);
+    }
   } else if (line.indexOf("\"ping\"") >= 0) {
-    tone(buzzerPin, 1800, 80);
-    showTempStatus("Azure Ping OK", getRtcString().substring(11), 2500);
+    if (!alarmActive) {
+      tone(buzzerPin, 1800, 80);
+      showTempStatus("Azure Ping OK", getRtcString().substring(11), 2500);
+    }
   } else if (line.indexOf("\"reset_state\"") >= 0) {
     wrongAttempts = 0;
     lcd.begin(16, 2);
@@ -235,30 +267,60 @@ void loop() {
   // 0. Lyt altid efter fjernstyring fra Raspberry Pi / Azure
   checkSerialFromPi();
 
-  // Automatisk tilbagevenden til laast startskaerm
-  if (doorIsOpen && currentMillis >= doorOpenUntil) {
-    resetToLocked();
-  }
-  if (tempMsgUntil > 0 && currentMillis >= tempMsgUntil && !doorIsOpen && !kortGodkendt) {
-    tempMsgUntil = 0;
-    visStartSkaerm();
-  }
-
-  // --- 1. Lydsensor maaling ---
-  unsigned long startMillis = millis();
-  unsigned int signalMax = 0;
-  unsigned int signalMin = 1024;
-  while (millis() - startMillis < sampleWindow) {
-    unsigned int sample = analogRead(soundAnalogPin);
-    if (sample < 1024) {
-      if (sample > signalMax) signalMax = sample;
-      else if (sample < signalMin) signalMin = sample;
+  // Hold non-blocking sirene i gang hvis alarm er aktiv
+  if (alarmActive) {
+    updateAlarmSiren(currentMillis);
+    // Tillad fysisk afstilling via 1984# på keypaden mens sirenen hyler!
+    char ak = customKeypad.getKey();
+    if (ak) {
+      if (ak == '#') {
+        if (alarmPinBuf == korrektKode) {
+          disarmLocalAlarm("By Local PIN");
+        } else {
+          alarmPinBuf = "";
+          lcd.setCursor(0, 1);
+          lcd.print("Wrong PIN!      ");
+        }
+      } else if (ak == '*') {
+        alarmPinBuf = "";
+        lcd.setCursor(0, 1);
+        lcd.print("PIN:            ");
+      } else if (alarmPinBuf.length() < 4) {
+        alarmPinBuf += ak;
+        lcd.setCursor(0, 1);
+        lcd.print("PIN: ");
+        for (unsigned int i = 0; i < alarmPinBuf.length(); i++) lcd.print("*");
+        lcd.print("       ");
+      }
+    }
+  } else {
+    // Automatisk tilbagevenden til laast startskaerm
+    if (doorIsOpen && currentMillis >= doorOpenUntil) {
+      resetToLocked();
+    }
+    if (tempMsgUntil > 0 && currentMillis >= tempMsgUntil && !doorIsOpen && !kortGodkendt) {
+      tempMsgUntil = 0;
+      visStartSkaerm();
     }
   }
-  unsigned int peakToPeak = (signalMax > signalMin) ? (signalMax - signalMin) : 0;
-  if (peakToPeak > maxPeakInInterval) maxPeakInInterval = peakToPeak;
 
-  // --- 2. Send JSON telemetri til Raspberry Pi -> Azure ---
+  // --- 1. Lydsensor maaling (kun naar egen sirene ikke hyler) ---
+  if (!alarmActive) {
+    unsigned long startMillis = millis();
+    unsigned int signalMax = 0;
+    unsigned int signalMin = 1024;
+    while (millis() - startMillis < sampleWindow) {
+      unsigned int sample = analogRead(soundAnalogPin);
+      if (sample < 1024) {
+        if (sample > signalMax) signalMax = sample;
+        else if (sample < signalMin) signalMin = sample;
+      }
+    }
+    unsigned int peakToPeak = (signalMax > signalMin) ? (signalMax - signalMin) : 0;
+    if (peakToPeak > maxPeakInInterval) maxPeakInInterval = peakToPeak;
+  }
+
+  // --- 2. Send JSON telemetri til Raspberry Pi -> Azure hvert 10. sek ---
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
 
@@ -286,78 +348,80 @@ void loop() {
     maxPeakInInterval = 0;
   }
 
-  // --- 3. Adgangskontrol (RFID foerst, derefter Keypad) ---
-  if (!kortGodkendt && !doorIsOpen) {
-    if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
-      senesteUID = getUidHex();
-      if (tjekUID()) {
-        tone(buzzerPin, 2000, 200);
-        kortGodkendt = true;
-        lcd.clear();
-        lcd.setCursor(1, 0);
-        lcd.print("Card Accepted!");
-        delay(1000);
-        lcd.clear();
-        lcd.setCursor(2, 0);
-        lcd.print("Enter Code");
-      } else {
-        tone(buzzerPin, 300, 500);
-        Serial.print("{\"type\":\"access_request\",\"credential\":\"");
-        Serial.print(senesteUID);
-        Serial.println("\",\"method\":\"rfid_invalid\"}");
-        lcd.clear();
-        lcd.setCursor(1, 0);
-        lcd.print("Invalid Card!");
-        delay(2000);
-        visStartSkaerm();
-      }
-      mfrc522.PICC_HaltA();
-      mfrc522.PCD_StopCrypto1();
-    }
-  } else if (kortGodkendt) {
-    char key = customKeypad.getKey();
-    if (key) {
-      if (key == '#') {
-        Serial.print("{\"type\":\"access_request\",\"credential\":\"");
-        Serial.print(senesteUID);
-        Serial.print(":");
-        Serial.print(indtastetKode);
-        Serial.println("\",\"method\":\"rfid_2fa\"}");
-
-        if (indtastetKode == korrektKode) {
-          openDoorNonBlocking("Access Granted!", "Serverroom open", 15000);
-          Serial.println("{\"type\":\"access_event\",\"event\":\"door_unlocked\"}");
-        } else {
-          wrongAttempts++;
-          tone(buzzerPin, 400, 300);
+  // --- 3. Normal 2FA Adgangskontrol (naar alarm ikke er aktiv) ---
+  if (!alarmActive) {
+    if (!kortGodkendt && !doorIsOpen) {
+      if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
+        senesteUID = getUidHex();
+        if (tjekUID()) {
+          tone(buzzerPin, 2000, 200);
+          kortGodkendt = true;
           lcd.clear();
           lcd.setCursor(1, 0);
-          lcd.print("Wrong Code!");
-          lcd.setCursor(2, 1);
-          lcd.print("Attempts: "); lcd.print(wrongAttempts);
+          lcd.print("Card Accepted!");
+          delay(1000);
+          lcd.clear();
+          lcd.setCursor(2, 0);
+          lcd.print("Enter Code");
+        } else {
+          tone(buzzerPin, 300, 500);
+          Serial.print("{\"type\":\"access_request\",\"credential\":\"");
+          Serial.print(senesteUID);
+          Serial.println("\",\"method\":\"rfid_invalid\"}");
+          lcd.clear();
+          lcd.setCursor(1, 0);
+          lcd.print("Invalid Card!");
           delay(2000);
-
-          if (wrongAttempts >= maxAttempts) {
-            Serial.println("{\"type\":\"access_event\",\"event\":\"local_bruteforce_alarm\"}");
-            wrongAttempts = 0;
-            triggerSiren(15);
-          } else {
-            digitalWrite(ledPinR, HIGH);
-            lcd.clear();
-            lcd.setCursor(2, 0);
-            lcd.print("Enter Code");
-          }
+          visStartSkaerm();
         }
-        indtastetKode = "";
-      } else if (key == '*') {
-        indtastetKode = "";
-        lcd.setCursor(0, 1);
-        lcd.print("                ");
-      } else {
-        if (indtastetKode.length() < 4) {
-          indtastetKode += key;
-          lcd.setCursor(6 + indtastetKode.length() - 1, 1);
-          lcd.print("*");
+        mfrc522.PICC_HaltA();
+        mfrc522.PCD_StopCrypto1();
+      }
+    } else if (kortGodkendt) {
+      char key = customKeypad.getKey();
+      if (key) {
+        if (key == '#') {
+          Serial.print("{\"type\":\"access_request\",\"credential\":\"");
+          Serial.print(senesteUID);
+          Serial.print(":");
+          Serial.print(indtastetKode);
+          Serial.println("\",\"method\":\"rfid_2fa\"}");
+
+          if (indtastetKode == korrektKode) {
+            openDoorNonBlocking("Access Granted!", "Serverroom open", 15000);
+            Serial.println("{\"type\":\"access_event\",\"event\":\"door_unlocked\"}");
+          } else {
+            wrongAttempts++;
+            tone(buzzerPin, 400, 300);
+            lcd.clear();
+            lcd.setCursor(1, 0);
+            lcd.print("Wrong Code!");
+            lcd.setCursor(2, 1);
+            lcd.print("Attempts: "); lcd.print(wrongAttempts);
+            delay(2000);
+
+            if (wrongAttempts >= maxAttempts) {
+              Serial.println("{\"type\":\"access_event\",\"event\":\"local_bruteforce_alarm\"}");
+              wrongAttempts = 0;
+              startPersistentAlarm("Enter PIN / Web");
+            } else {
+              digitalWrite(ledPinR, HIGH);
+              lcd.clear();
+              lcd.setCursor(2, 0);
+              lcd.print("Enter Code");
+            }
+          }
+          indtastetKode = "";
+        } else if (key == '*') {
+          indtastetKode = "";
+          lcd.setCursor(0, 1);
+          lcd.print("                ");
+        } else {
+          if (indtastetKode.length() < 4) {
+            indtastetKode += key;
+            lcd.setCursor(6 + indtastetKode.length() - 1, 1);
+            lcd.print("*");
+          }
         }
       }
     }

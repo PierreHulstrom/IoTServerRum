@@ -168,6 +168,11 @@ class AutoCoolingReq(BaseModel):
     enabled: bool
 
 
+class DisarmReq(BaseModel):
+    device_id: str = "pi1"
+    password: str
+
+
 class UserCreateReq(BaseModel):
     username: str
     password: str
@@ -474,3 +479,19 @@ def export_anomalies_csv(session: dict = Depends(verify_session)):
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=serverroom_ai_anomalies.csv"},
     )
+
+
+@app.post("/api/alarm/disarm")
+def disarm_alarm(req: DisarmReq, session: dict = Depends(require_role("admin", "operator"))):
+    verified = authenticate_user(session["username"], req.password)
+    if not verified:
+        log_system("auth", "WARNING", f"Fejlet alarm-afstilling (forkert kodeord) af '{session['username']}'")
+        raise HTTPException(status_code=401, detail="Forkert kodeord – alarmen fortsætter")
+    res = publish_command(
+        req.device_id,
+        "alarm_stop",
+        {"disarmed_by": session["username"]},
+        issued_by=session["username"],
+    )
+    log_system("security", "INFO", f"Alarm afstillet (step-up auth) på {req.device_id} af '{session['username']}'")
+    return {"status": "disarmed", "detail": res}

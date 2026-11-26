@@ -115,3 +115,30 @@ class TestLiveCSVExport(unittest.TestCase):
         self.assertEqual(c2, 200)
         self.assertIn("text/csv", {k.lower(): v for k, v in hdrs.items()}.get("content-type", ""))
         self.assertIn("time,device_id,zone,temperature,humidity,noise_db", csv_body)
+
+
+class TestLiveAlarmDisarm(unittest.TestCase):
+    def test_11_disarm_alarm_rejects_wrong_password(self):
+        c, _, body = req(f"{BASE_LOCAL}/api/login", method="POST", body={"username": USER, "password": PASS})
+        self.assertEqual(c, 200)
+        tok = json.loads(body)["token"]
+        c2, _, _ = req(
+            f"{BASE_LOCAL}/api/alarm/disarm",
+            method="POST",
+            body={"device_id": "pi1", "password": "forkert_kode"},
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+        self.assertEqual(c2, 401)
+
+    def test_12_disarm_alarm_accepts_valid_password(self):
+        c, _, body = req(f"{BASE_LOCAL}/api/login", method="POST", body={"username": USER, "password": PASS})
+        self.assertEqual(c, 200)
+        tok = json.loads(body)["token"]
+        c2, _, body2 = req(
+            f"{BASE_LOCAL}/api/alarm/disarm",
+            method="POST",
+            body={"device_id": "pi1", "password": PASS},
+            headers={"Authorization": f"Bearer {tok}"},
+        )
+        self.assertEqual(c2, 200)
+        self.assertEqual(json.loads(body2)["status"], "disarmed")
