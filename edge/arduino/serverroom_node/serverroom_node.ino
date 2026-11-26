@@ -1,5 +1,6 @@
 /* =========================================================================
- * Serverrum IoT – Elegoo / Arduino Mega 2560 (Azure + Pi + Lokal 2FA + Vedvarende Alarm)
+ * Serverrum IoT - Elegoo / Arduino Mega 2560
+ * Azure MQTTS + Pi + Lokal 2FA + Vedvarende Alarm + PWM Blæser (Pin 12)
  * ========================================================================= */
 #include <Keypad.h>
 #include <dhtnew.h>
@@ -9,7 +10,7 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// Holdets fysiske pins (RC522 RST på Pin 5 – nul konflikt med LCD ben 6-11)
+// Holdets fysiske pins (RC522 RST på Pin 5 - nul konflikt med LCD ben 6-11)
 #define RST_PIN 5
 #define SS_PIN  53
 MFRC522 mfrc522(SS_PIN, RST_PIN);
@@ -24,10 +25,17 @@ unsigned long previousSensorMillis = 0;
 const unsigned long sensorInterval = 10000;
 unsigned int maxPeakInInterval = 0;
 
-// LED og Buzzer pins
+// LED, Buzzer og PWM-Blæser (Pin 12 fra lab02 - Timer 1, ingen konflikt med tone())
 const int ledPinG = 2;
 const int ledPinR = 22;
 const int buzzerPin = 24;
+const int fanPin = 12;
+
+// Blæserhastigheder (0-255, justér frit efter ønsket effekt) & ASHRAE-grænse
+const int FAN_PWM_PREVENTIVE = 90;       // Præventiv AI-køling / dashboard "Start blæser"
+const int FAN_PWM_CRITICAL   = 180;      // Kraftig køling ved overophedning >= 27.0 C
+const float TEMP_MAX_THRESHOLD   = 27.0; // ASHRAE TC 9.9 max temperatur
+const float TEMP_RESET_THRESHOLD = 25.5; // Hysterese ved automatisk nedkøling
 
 // LCD: Ben 6, 7, 8, 9, 10, 11
 LiquidCrystal lcd(6, 7, 8, 9, 10, 11);
@@ -60,6 +68,12 @@ bool doorIsOpen = false;
 unsigned long doorOpenUntil = 0;
 unsigned long tempMsgUntil = 0;
 
+// Blæser-tilstand
+bool fanActive = false;
+int fanPwmCurrent = 0;
+bool fanManualOn = false;
+bool tempOverheatLatched = false;
+
 // Non-blocking vedvarende alarm (stopper KUN ved PIN 1984# eller Azure alarm_stop!)
 bool alarmActive = false;
 unsigned long lastSirenToggleMs = 0;
@@ -67,6 +81,25 @@ bool sirenHigh = false;
 String alarmPinBuf = "";
 
 String serialBuf = "";
+
+// --- BLÆSERSTYRING (PWM PIN 12) ---
+void setFanSpeed(int pwm) {
+  if (pwm <= 0) {
+    analogWrite(fanPin, 0);
+    fanActive = false;
+    fanPwmCurrent = 0;
+    return;
+  }
+  if (pwm > 255) pwm = 255;
+  // Kort kickstart fra stilstand så DC-blæseren altid starter sikkert
+  if (!fanActive && pwm < 180) {
+    analogWrite(fanPin, 180);
+    delay(120);
+  }
+  analogWrite(fanPin, pwm);
+  fanActive = true;
+  fanPwmCurrent = pwm;
+}
 
 // --- HJÆLPEFUNKTIONER ---
 void wakeRfid() {
@@ -100,7 +133,7 @@ void visStartSkaerm() {
   lcd.setCursor(3, 0);
   lcd.print("Scan Card");
   lcd.setCursor(4, 1);
-  lcd.print("To Start");
+  lcd.print(fanActive ? "Fan: ON " : "To Start");
   wakeRfid();
 }
 
@@ -128,6 +161,7 @@ void resetToLocked() {
 }
 
 void startPersistentAlarm(const String &subtext) {
+  if (alarmActive) return; // Allerede i alarm - afbryd ikke evt. PIN-indtastning!
   alarmActive = true;
   alarmPinBuf = "";
   doorIsOpen = false;
@@ -208,11 +242,16 @@ void handleIncomingCommand(const String &line) {
     showTempStatus("Door Locked", "By Azure Admin", 2000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_lock\"}");
   } else if (line.indexOf("\"fan_on\"") >= 0) {
+    fanManualOn = true;
+    int targetPwm = (fanPwmCurrent > FAN_PWM_PREVENTIVE) ? fanPwmCurrent : FAN_PWM_PREVENTIVE;
+    setFanSpeed(targetPwm);
     if (!alarmActive) {
       tone(buzzerPin, 1400, 120);
       showTempStatus("Cooling: ON", "Azure / AI Auto", 3000);
     }
   } else if (line.indexOf("\"fan_off\"") >= 0) {
+    fanManualOn = false;
+    setFanSpeed(0);
     if (!alarmActive) {
       tone(buzzerPin, 900, 120);
       showTempStatus("Cooling: OFF", "Normal mode", 3000);
@@ -224,6 +263,9 @@ void handleIncomingCommand(const String &line) {
     }
   } else if (line.indexOf("\"reset_state\"") >= 0) {
     wrongAttempts = 0;
+    fanManualOn = false;
+    tempOverheatLatched = false;
+    setFanSpeed(0);
     lcd.begin(16, 2);
     resetToLocked();
     tone(buzzerPin, 1500, 100);
@@ -256,6 +298,8 @@ void setup() {
   pinMode(ledPinG, OUTPUT);
   pinMode(ledPinR, OUTPUT);
   pinMode(buzzerPin, OUTPUT);
+  pinMode(fanPin, OUTPUT);
+  analogWrite(fanPin, 0);
 
   lcd.begin(16, 2);
   resetToLocked();
@@ -320,7 +364,7 @@ void loop() {
     if (peakToPeak > maxPeakInInterval) maxPeakInInterval = peakToPeak;
   }
 
-  // --- 2. Send JSON telemetri til Raspberry Pi -> Azure hvert 10. sek ---
+  // --- 2. Mål DHT22, tjek lokal overophedning og send JSON telemetri hvert 10. sek ---
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
 
@@ -332,15 +376,40 @@ void loop() {
 
     int status = mySensor.read();
     bool dhtSuccess = (status == DHTLIB_OK);
+    float tempVal = 0.0;
+    float humVal = 0.0;
+
+    if (dhtSuccess) {
+      tempVal = mySensor.getTemperature();
+      humVal = mySensor.getHumidity();
+
+      // Lokal Edge Fail-Safe: Ved overophedning (>= 27.0 C) tænd blæser + alarm med det samme!
+      if (tempVal >= TEMP_MAX_THRESHOLD) {
+        if (!tempOverheatLatched) {
+          tempOverheatLatched = true;
+          setFanSpeed(FAN_PWM_CRITICAL);
+          startPersistentAlarm("OVERHEAT! >27C");
+          Serial.println("{\"type\":\"access_event\",\"event\":\"local_overheat_alarm\"}");
+        }
+      } else if (tempVal <= TEMP_RESET_THRESHOLD && tempOverheatLatched) {
+        tempOverheatLatched = false;
+        if (!fanManualOn) {
+          setFanSpeed(0);
+          if (!alarmActive && !doorIsOpen && !kortGodkendt) visStartSkaerm();
+        }
+      }
+    }
 
     Serial.print("{\"type\":\"telemetry\",\"zone\":\"rack1\",\"temperature\":");
-    if (dhtSuccess) Serial.print(mySensor.getTemperature(), 2);
+    if (dhtSuccess) Serial.print(tempVal, 2);
     else Serial.print("null");
     Serial.print(",\"humidity\":");
-    if (dhtSuccess) Serial.print(mySensor.getHumidity(), 2);
+    if (dhtSuccess) Serial.print(humVal, 2);
     else Serial.print("null");
     Serial.print(",\"noise_db\":");
     Serial.print(estimateddB, 1);
+    Serial.print(",\"fan\":");
+    Serial.print(fanActive ? 1 : 0);
     Serial.print(",\"rtc\":\"");
     Serial.print(getRtcString());
     Serial.println("\"}");

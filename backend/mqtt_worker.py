@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 import paho.mqtt.client as mqtt
 from db import get_conn
+from emailer import send_alert_async
 from ai_engine import analyze_reading
 
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
@@ -90,16 +91,38 @@ def _handle_telemetry(device_id: str, payload: dict):
     update_device_status(device_id, "online", {"zone": zone})
     ai_res = analyze_reading(device_id, temp, hum, noise)
 
-    # Autonom 2-trins Closed-Loop AI -> Fjernstyring (med 60s cooldown)
+    # Mail-advarsel ved kritisk ASHRAE-overskridelse (uanset auto-køling)
+    if ai_res.get("threshold_breached"):
+        send_alert_async(
+            f"ashrae:{device_id}",
+            f"Kritisk serverrumsalarm på {device_id}",
+            f"ASHRAE-grænseværdi overskredet på {device_id}!
+Temp: {temp} C | Fugt: {hum} % | Støj: {noise} dB",
+            severity="CRITICAL",
+            cooldown_sec=300,
+        )
+
+    # Autonom 2-trins Closed-Loop AI -> Fjernstyring (adskilt 60s cooldown for alarm & blæser)
     if _auto_cooling_enabled:
         now = time.time()
         if ai_res.get("threshold_breached"):
-            if now - _last_auto_action_ts.get(device_id, 0) >= 60:
-                _last_auto_action_ts[device_id] = now
+            alarm_key = f"{device_id}:alarm"
+            if now - _last_auto_action_ts.get(alarm_key, 0) >= 60:
+                _last_auto_action_ts[alarm_key] = now
                 publish_command(
                     device_id,
                     "alarm_test",
                     {"reason": "ashrae_threshold_breached", "temp": temp, "hum": hum, "noise": noise},
+                    issued_by="ai_autopilot",
+                )
+        if ai_res.get("critical_action_needed"):
+            fan_key = f"{device_id}:fan"
+            if now - _last_auto_action_ts.get(fan_key, 0) >= 60:
+                _last_auto_action_ts[fan_key] = now
+                publish_command(
+                    device_id,
+                    "fan_on",
+                    {"reason": "ai_auto_protection", "temp": temp},
                     issued_by="ai_autopilot",
                 )
         elif ai_res.get("critical_action_needed"):
@@ -125,6 +148,13 @@ def _handle_status(device_id: str, raw_text: str):
     update_device_status(device_id, status, meta)
     if status != "online":
         log_system("mqtt_worker", "ERROR", f"Enhed '{device_id}' gik OFFLINE (LWT/status)", meta)
+        send_alert_async(
+            f"offline:{device_id}",
+            f"Edge-enhed '{device_id}' er OFFLINE",
+            f"Enheden '{device_id}' har mistet forbindelsen til Azure MQTT (status: {status}). Tjek strøm eller netværk.",
+            severity="ERROR",
+            cooldown_sec=300,
+        )
 
 
 def _handle_access_request(payload: dict):
@@ -195,6 +225,13 @@ def _handle_access_request(payload: dict):
                 "alarm_test",
                 {"seconds": 5, "reason": "door_bruteforce"},
                 issued_by="security_watchdog",
+            )
+            send_alert_async(
+                f"door_bruteforce:{payload.get('device_id', 'ukendt')}",
+                "Fysisk adgangsalarm: gentagne afviste forsøg",
+                f"Der er registreret gentagne afviste RFID/PIN-forsøg ved døren ({payload.get('device_id', 'ukendt')}). Lokal alarm er udløst.",
+                severity="CRITICAL",
+                cooldown_sec=120,
             )
 
 

@@ -21,6 +21,7 @@ from auth_utils import (
     upsert_user,
 )
 from db import db_ping, get_conn
+from emailer import send_alert_async
 from mqtt_worker import (
     get_auto_cooling,
     hash_credential,
@@ -204,6 +205,13 @@ def login(req: LoginReq, request: Request):
     _login_failures[rate_key] = recent
     if len(recent) >= LOGIN_MAX_ATTEMPTS:
         log_system("auth", "WARNING", f"Rate-limit blokerede '{req.username}' fra {client_ip} (429)")
+        send_alert_async(
+            f"login_429:{client_ip}:{req.username}",
+            f"Web-login blokeret (429) for '{req.username}'",
+            f"IP {client_ip} blev midlertidigt blokeret efter {LOGIN_MAX_ATTEMPTS} fejlede login-forsøg mod '{req.username}' på Dashboardet.",
+            severity="WARNING",
+            cooldown_sec=300,
+        )
         raise HTTPException(status_code=429, detail="For mange fejlede forsøg – prøv igen om 5 min")
 
     user = authenticate_user(req.username, req.password)
