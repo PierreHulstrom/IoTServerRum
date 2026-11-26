@@ -73,7 +73,7 @@
 <body>
   <div id="login-screen">
     <form class="login-box" onsubmit="doLogin(event)">
-      <h1>🔒 Serverrum IoT Login</h1>
+      <h1>Serverrum IoT – Login</h1>
       <div style="color:var(--muted);font-size:0.85rem">Sikret adgang via HTTPS + Token</div>
       <input id="u" placeholder="Brugernavn" autocomplete="username" required />
       <input id="p" type="password" placeholder="Kodeord" autocomplete="current-password" required />
@@ -84,11 +84,11 @@
 
   <div id="app" class="hidden">
     <header>
-      <div class="brand">🖥️ Serverrum IoT – Operations Center</div>
+      <div class="brand">Serverrum IoT – Operations Center</div>
       <div class="pills">
         <span id="p-mqtt" class="pill">MQTT: ...</span>
         <span id="p-db" class="pill">MariaDB: ...</span>
-        <span id="p-user" class="pill">👤 ...</span>
+        <span id="p-user" class="pill">Bruger: ...</span>
         <span id="p-upd" class="pill">Opdaterer...</span>
         <button class="sec" onclick="logout()">Log ud</button>
       </div>
@@ -103,8 +103,8 @@
           </select>
         </div>
         <div class="btn-row" style="margin:0">
-          <button class="sec" onclick="downloadCsv('/api/export/sensors.csv','serverroom_sensors.csv')">⬇️ Sensordata (CSV)</button>
-          <button class="sec" onclick="downloadCsv('/api/export/anomalies.csv','serverroom_ai_anomalies.csv')">⬇️ AI-alarmer (CSV)</button>
+          <button class="sec" onclick="downloadCsv('/api/export/sensors.csv','serverroom_sensors.csv')">Eksporter sensordata (CSV)</button>
+          <button class="sec" onclick="downloadCsv('/api/export/anomalies.csv','serverroom_ai_anomalies.csv')">Eksporter AI-alarmer (CSV)</button>
         </div>
       </section>
 
@@ -133,30 +133,30 @@
 
       <section class="grid-2">
         <div class="card">
-          <h2>📈 Temperatur &amp; Luftfugtighed (Live)</h2>
+          <h2>Temperatur &amp; Luftfugtighed (Live)</h2>
           <canvas id="envChart" height="120"></canvas>
         </div>
         <div class="card">
-          <h2>🔊 Støjniveau i dB (Live)</h2>
+          <h2>Støjniveau i dB (Live)</h2>
           <canvas id="noiseChart" height="120"></canvas>
         </div>
       </section>
 
       <section class="grid-2">
         <div class="card">
-          <h2>🎛️ Tovejs Fjernstyring (Azure → Pi/Arduino)</h2>
+          <h2>Tovejs Fjernstyring (Azure → Pi/Arduino)</h2>
           <div class="form-inline">
             <label style="align-self:center;color:var(--muted);font-size:0.85rem">Enhed:</label>
             <input id="cmd-dev" value="pi1" style="width:110px" />
           </div>
           <div class="btn-row">
-            <button class="success" onclick="sendCmd('unlock_door', {seconds:5})">🔓 Lås dør op (5s)</button>
-            <button class="sec" onclick="sendCmd('lock_door', {})">🔒 Lås dør</button>
-            <button onclick="sendCmd('fan_on', {})">🌀 Tænd blæser</button>
-            <button class="sec" onclick="sendCmd('fan_off', {})">⏹️ Sluk blæser</button>
-            <button class="danger" onclick="sendCmd('alarm_test', {seconds:3})">🚨 Test alarm</button>
-            <button class="sec" onclick="sendCmd('ping', {})">📡 Ping Pi</button>
-            <button id="btn-auto" class="success" onclick="toggleAuto()">🤖 AI Auto-køling: TIL</button>
+            <button class="success" onclick="sendCmd('unlock_door', {seconds:5})">Lås dør op (5s)</button>
+            <button class="sec" onclick="sendCmd('lock_door', {})">Lås dør</button>
+            <button onclick="sendCmd('fan_on', {})">Tænd blæser</button>
+            <button class="sec" onclick="sendCmd('fan_off', {})">Sluk blæser</button>
+            <button class="danger" onclick="sendCmd('alarm_test', {seconds:3})">Test alarm</button>
+            <button class="sec" onclick="sendCmd('ping', {})">Ping enhed</button>
+            <button id="btn-auto" class="success" onclick="toggleAuto()">AI Auto-køling: TIL</button>
           </div>
           <div class="scroll">
             <table>
@@ -167,7 +167,7 @@
         </div>
 
         <div class="card">
-          <h2>🩺 Driftstatus &amp; Enheder (Heartbeat / LWT)</h2>
+          <h2>Driftstatus &amp; Enheder (Heartbeat / LWT)</h2>
           <div id="srv-metrics" class="pills" style="margin-bottom:10px"><span class="pill">Azure CPU/RAM indlæser...</span></div>
           <div class="scroll">
             <table>
@@ -175,7 +175,7 @@
               <tbody id="t-devs"></tbody>
             </table>
           </div>
-          <h2 style="margin-top:16px">🤖 Seneste AI-afvigelser &amp; Forudsigelser</h2>
+          <h2 style="margin-top:16px">Seneste AI-afvigelser &amp; Forudsigelser</h2>
           <div class="scroll">
             <table>
               <thead><tr><th>Tid</th><th>Enhed</th><th>Besked</th></tr></thead>
@@ -187,7 +187,7 @@
 
       <section class="grid-2">
         <div class="card">
-          <h2>🪪 Fysisk Adgangskontrol (SHA-256 hashede kort/PIN)</h2>
+          <h2>Fysisk Adgangskontrol (SHA-256 hashede kort/PIN)</h2>
           <form class="form-inline" onsubmit="addCard(event)">
             <input id="c-name" placeholder="Navn (fx Pierre)" required />
             <input id="c-role" placeholder="Rolle" value="admin" style="width:95px" required />
@@ -200,7 +200,7 @@
               <tbody id="t-cards"></tbody>
             </table>
           </div>
-          <h2 style="margin-top:16px">🚪 Adgangslog</h2>
+          <h2 style="margin-top:16px">Adgangslog</h2>
           <div class="scroll">
             <table>
               <thead><tr><th>Tid</th><th>Dør</th><th>Person</th><th>Resultat</th></tr></thead>
@@ -210,7 +210,7 @@
         </div>
 
         <div class="card">
-          <h2>📋 Central System- &amp; Fejllog</h2>
+          <h2>Central System- &amp; Fejllog</h2>
           <div class="scroll" style="max-height:460px">
             <table>
               <thead><tr><th>Tid</th><th>Kilde</th><th>Niveau</th><th>Besked</th></tr></thead>
@@ -221,7 +221,7 @@
       </section>
 
       <section id="admin-users-sec" class="card hidden">
-        <h2>👥 Dashboard-brugere &amp; RBAC (PBKDF2-SHA256)</h2>
+        <h2>Dashboard-brugere &amp; RBAC (PBKDF2-SHA256)</h2>
         <form class="form-inline" onsubmit="addDashUser(event)">
           <input id="du-name" placeholder="Brugernavn (fx andrew)" required />
           <input id="du-pass" type="password" placeholder="Kodeord (min. 8 tegn)" minlength="8" required />
@@ -278,7 +278,7 @@
         if (!res.ok) {
           document.getElementById("login-err").textContent =
             res.status === 429
-              ? "🚫 For mange fejlede forsøg – blokeret i 5 min (HTTP 429)"
+              ? "For mange fejlede forsøg – blokeret i 5 min (HTTP 429)"
               : "Forkert brugernavn eller kodeord";
           return;
         }
@@ -331,7 +331,7 @@
         pd.className = "pill " + (d.health.db ? "ok" : "err");
         document.getElementById("p-upd").textContent = "Opdateret " + new Date().toLocaleTimeString("da-DK");
         if (d.current_user) {
-          document.getElementById("p-user").textContent = `👤 ${d.current_user.username} (${d.current_user.role})`;
+          document.getElementById("p-user").textContent = `${d.current_user.username} (${d.current_user.role})`;
           const sec = document.getElementById("admin-users-sec");
           if (d.current_user.role === "admin") {
             sec.classList.remove("hidden");
@@ -357,7 +357,7 @@
         if (d.settings) {
           window._autoCool = !!d.settings.auto_cooling;
           const b = document.getElementById("btn-auto");
-          b.textContent = "🤖 AI Auto-køling: " + (window._autoCool ? "TIL" : "FRA");
+          b.textContent = "AI Auto-køling: " + (window._autoCool ? "TIL" : "FRA");
           b.className = window._autoCool ? "success" : "sec";
         }
 
@@ -383,7 +383,7 @@
 
         if (d.anomalies.length) {
           const a = d.anomalies[0];
-          document.getElementById("k-ai").innerHTML = a.is_anomaly ? '<span style="color:var(--red)">⚠️ Afvigelse</span>' : '<span style="color:var(--amber)">📈 Trend</span>';
+          document.getElementById("k-ai").innerHTML = a.is_anomaly ? '<span style="color:var(--red)">Afvigelse</span>' : '<span style="color:var(--amber)">Stigende trend</span>';
           document.getElementById("k-ai-sub").textContent = `${a.time}: ${a.message}`;
         }
 
