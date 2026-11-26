@@ -23,6 +23,8 @@ _connected = False
 # Indstilling for autonom AI -> fjernstyring (kan skiftes live i dashboardet)
 _auto_cooling_enabled = True
 _last_auto_action_ts: dict[str, float] = {}
+_active_env_alarm: dict[str, bool] = {}
+_active_auto_fan: dict[str, bool] = {}
 
 # Brute-force sporing for fysisk dørlæser (3 fejl inden for 60 sek -> alarm)
 _failed_access_attempts: dict[str, list[float]] = defaultdict(list)
@@ -101,7 +103,9 @@ def _handle_telemetry(device_id: str, payload: dict):
             cooldown_sec=300,
         )
 
-    # Autonom 2-trins Closed-Loop AI -> Fjernstyring (adskilt 60s cooldown for alarm & blæser)
+    # Autonom 2-trins Closed-Loop AI -> Fjernstyring:
+    # - Alarm (alarm_test) kræver ALTID manuel afstilling (PIN 1984# eller Dashboard kodeord)
+    # - Blæser (fan_auto / fan_auto_off) starter automatisk og stopper igen når temp < 27 C
     if _auto_cooling_enabled:
         now = time.time()
         if ai_res.get("threshold_breached"):
@@ -114,26 +118,27 @@ def _handle_telemetry(device_id: str, payload: dict):
                     {"reason": "ashrae_threshold_breached", "temp": temp, "hum": hum, "noise": noise},
                     issued_by="ai_autopilot",
                 )
+
         if ai_res.get("critical_action_needed"):
             fan_key = f"{device_id}:fan"
+            _active_auto_fan[device_id] = True
             if now - _last_auto_action_ts.get(fan_key, 0) >= 60:
                 _last_auto_action_ts[fan_key] = now
                 publish_command(
                     device_id,
-                    "fan_on",
+                    "fan_auto",
                     {"reason": "ai_auto_protection", "temp": temp},
                     issued_by="ai_autopilot",
                 )
-        elif ai_res.get("critical_action_needed"):
-            if now - _last_auto_action_ts.get(device_id, 0) >= 60:
-                _last_auto_action_ts[device_id] = now
-                publish_command(
-                    device_id,
-                    "fan_on",
-                    {"reason": "ai_auto_protection", "temp": temp},
-                    issued_by="ai_autopilot",
-                )
-
+        elif _active_auto_fan.get(device_id):
+            _active_auto_fan[device_id] = False
+            _last_auto_action_ts.pop(f"{device_id}:fan", None)
+            publish_command(
+                device_id,
+                "fan_auto_off",
+                {"reason": "temp_normalized", "temp": temp},
+                issued_by="ai_autopilot",
+            )
 
 def _handle_status(device_id: str, raw_text: str):
     try:

@@ -187,6 +187,30 @@ class TestMqttResilience(unittest.TestCase):
         self.assertEqual(mock_log.call_args[0][1], "ERROR")
 
 
+    def test_ai_autopilot_auto_clears_env_and_fan_when_normalized(self):
+        mqtt_worker._last_auto_action_ts.clear()
+        mqtt_worker._active_env_alarm.clear()
+        mqtt_worker._active_auto_fan.clear()
+        mqtt_worker.set_auto_cooling(True)
+        conn, _ = make_mock_conn(fetchall_val=[])
+        with patch("mqtt_worker.get_conn", return_value=conn), \
+             patch("mqtt_worker.update_device_status"), \
+             patch("mqtt_worker.publish_command") as mock_pub:
+            # 1. Overophedning -> både env_alarm og fan_auto
+            with patch("mqtt_worker.analyze_reading", return_value={"threshold_breached": True, "critical_action_needed": True, "is_anomaly": True, "score": -0.5, "reasons": ["Temp > 27"]}):
+                mqtt_worker._handle_telemetry("pi1", {"temperature": 28.5, "humidity": 45.0, "noise_db": 42.0})
+            cmds_hot = [c[0][1] for c in mock_pub.call_args_list]
+            self.assertIn("alarm_test", cmds_hot)
+            self.assertIn("fan_auto", cmds_hot)
+
+            mock_pub.reset_mock()
+            # 2. Normaliseret (< 27 C, normal fugt & støj) -> auto env_clear + fan_auto_off
+            with patch("mqtt_worker.analyze_reading", return_value={"threshold_breached": False, "critical_action_needed": False, "is_anomaly": False, "score": 0.1, "reasons": []}):
+                mqtt_worker._handle_telemetry("pi1", {"temperature": 25.0, "humidity": 45.0, "noise_db": 42.0})
+            cmds_ok = [c[0][1] for c in mock_pub.call_args_list]
+            self.assertNotIn("alarm_stop", cmds_ok)
+            self.assertIn("fan_auto_off", cmds_ok)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -219,6 +243,7 @@ class TestHardeningAndAutomation(unittest.TestCase):
 
     def test_ai_autopilot_sends_fan_on_on_critical_temp(self):
         mqtt_worker._last_auto_action_ts.clear()
+        mqtt_worker._active_auto_fan.clear()
         mqtt_worker.set_auto_cooling(True)
         conn, _ = make_mock_conn(fetchall_val=[])
         with patch("mqtt_worker.get_conn", return_value=conn), \
@@ -227,11 +252,12 @@ class TestHardeningAndAutomation(unittest.TestCase):
              patch("mqtt_worker.publish_command") as mock_pub:
             mqtt_worker._handle_telemetry("pi1", {"temperature": 29.0, "humidity": 45.0, "noise_db": 55.0})
             mock_pub.assert_called_once()
-            self.assertEqual(mock_pub.call_args[0][1], "fan_on")
+            self.assertEqual(mock_pub.call_args[0][1], "fan_auto")
 
 
     def test_ai_autopilot_triggers_alarm_on_threshold_breach(self):
         mqtt_worker._last_auto_action_ts.clear()
+        mqtt_worker._active_auto_fan.clear()
         mqtt_worker.set_auto_cooling(True)
         conn, _ = make_mock_conn(fetchall_val=[])
         with patch("mqtt_worker.get_conn", return_value=conn), \

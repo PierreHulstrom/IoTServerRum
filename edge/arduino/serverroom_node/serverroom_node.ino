@@ -1,6 +1,8 @@
 /* =========================================================================
  * Serverrum IoT - Elegoo / Arduino Mega 2560
- * Azure MQTTS + Pi + Lokal 2FA + Vedvarende Alarm + PWM Blæser (Pin 12)
+ * Azure MQTTS + Pi + Lokal 2FA + PWM Blæser (Pin 12) + LCD Anti-Glitch
+ * - ALLE alarmer kræver manuel afstilling (PIN 1984# eller Azure kodeord)
+ * - Blæser (Pin 12) starter ved AI-advarsel / >= 27 C og stopper selv under 27 C
  * ========================================================================= */
 #include <Keypad.h>
 #include <dhtnew.h>
@@ -25,17 +27,16 @@ unsigned long previousSensorMillis = 0;
 const unsigned long sensorInterval = 10000;
 unsigned int maxPeakInInterval = 0;
 
-// LED, Buzzer og PWM-Blæser (Pin 12 fra lab02 - Timer 1, ingen konflikt med tone())
+// LED, Buzzer og PWM-Blæser (Pin 12 - Timer 1, ingen konflikt med tone())
 const int ledPinG = 2;
 const int ledPinR = 22;
 const int buzzerPin = 24;
 const int fanPin = 12;
 
-// Blæserhastigheder (0-255, justér frit efter ønsket effekt) & ASHRAE-grænse
+// Blæserhastigheder (0-255, justér frit) & ASHRAE-grænse
 const int FAN_PWM_PREVENTIVE = 90;       // Præventiv AI-køling / dashboard "Start blæser"
 const int FAN_PWM_CRITICAL   = 180;      // Kraftig køling ved overophedning >= 27.0 C
-const float TEMP_MAX_THRESHOLD   = 27.0; // ASHRAE TC 9.9 max temperatur
-const float TEMP_RESET_THRESHOLD = 25.5; // Hysterese ved automatisk nedkøling
+const float TEMP_MAX_THRESHOLD = 27.0;   // ASHRAE TC 9.9 max temperatur
 
 // LCD: Ben 6, 7, 8, 9, 10, 11
 LiquidCrystal lcd(6, 7, 8, 9, 10, 11);
@@ -56,7 +57,7 @@ Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS)
 RTC_DS3231 rtc;
 bool rtcOk = false;
 
-// Tilstande
+// Adgangstilstande
 bool kortGodkendt = false;
 String indtastetKode = "";
 String korrektKode = "1984";
@@ -68,21 +69,34 @@ bool doorIsOpen = false;
 unsigned long doorOpenUntil = 0;
 unsigned long tempMsgUntil = 0;
 
-// Blæser-tilstand
+// Blæser-tilstand (adskilt manuel vs. automatisk AI/DHT-styring)
 bool fanActive = false;
 int fanPwmCurrent = 0;
 bool fanManualOn = false;
-bool tempOverheatLatched = false;
+bool fanAutoOn = false;
+bool localTempHigh = false;
 
-// Non-blocking vedvarende alarm (stopper KUN ved PIN 1984# eller Azure alarm_stop!)
+// Vedvarende alarm (stopper KUN ved manuel PIN 1984# eller Azure alarm_stop!)
 bool alarmActive = false;
+bool tempAlarmMutedWhileHot = false;
 unsigned long lastSirenToggleMs = 0;
 bool sirenHigh = false;
 String alarmPinBuf = "";
 
 String serialBuf = "";
 
-// --- BLÆSERSTYRING (PWM PIN 12) ---
+// --- LCD RESYNC (fjerner krøllede HD44780-tegn efter motor-/buzzer-spændingsdyk) ---
+void lcdWriteSafe(const String &l1, const String &l2) {
+  lcd.begin(16, 2);
+  delay(5);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(l1.substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print(l2.substring(0, 16));
+}
+
+// --- BLÆSERSTYRING MED SOFT-START (PWM PIN 12) ---
 void setFanSpeed(int pwm) {
   if (pwm <= 0) {
     analogWrite(fanPin, 0);
@@ -91,14 +105,27 @@ void setFanSpeed(int pwm) {
     return;
   }
   if (pwm > 255) pwm = 255;
-  // Kort kickstart fra stilstand så DC-blæseren altid starter sikkert
-  if (!fanActive && pwm < 180) {
-    analogWrite(fanPin, 180);
-    delay(120);
+  if (!fanActive) {
+    int step1 = (pwm > 60) ? 60 : pwm;
+    int step2 = (pwm > 120) ? 120 : pwm;
+    analogWrite(fanPin, step1);
+    delay(25);
+    analogWrite(fanPin, step2);
+    delay(25);
   }
   analogWrite(fanPin, pwm);
   fanActive = true;
   fanPwmCurrent = pwm;
+}
+
+void syncFanState() {
+  if (localTempHigh) {
+    setFanSpeed(FAN_PWM_CRITICAL);
+  } else if (fanAutoOn || fanManualOn) {
+    setFanSpeed(FAN_PWM_PREVENTIVE);
+  } else {
+    setFanSpeed(0);
+  }
 }
 
 // --- HJÆLPEFUNKTIONER ---
@@ -129,20 +156,12 @@ String getUidHex() {
 }
 
 void visStartSkaerm() {
-  lcd.clear();
-  lcd.setCursor(3, 0);
-  lcd.print("Scan Card");
-  lcd.setCursor(4, 1);
-  lcd.print(fanActive ? "Fan: ON " : "To Start");
+  lcdWriteSafe("   Scan Card", fanActive ? "    Fan: ON" : "    To Start");
   wakeRfid();
 }
 
 void showTempStatus(const String &l1, const String &l2, unsigned long ms) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(l1.substring(0, 16));
-  lcd.setCursor(0, 1);
-  lcd.print(l2.substring(0, 16));
+  lcdWriteSafe(l1, l2);
   tempMsgUntil = millis() + ms;
   wakeRfid();
 }
@@ -160,8 +179,9 @@ void resetToLocked() {
   visStartSkaerm();
 }
 
+// Vedvarende alarm - kræver ALTID manuel afstilling (PIN 1984# eller Azure kodeord)!
 void startPersistentAlarm(const String &subtext) {
-  if (alarmActive) return; // Allerede i alarm - afbryd ikke evt. PIN-indtastning!
+  if (alarmActive) return;
   alarmActive = true;
   alarmPinBuf = "";
   doorIsOpen = false;
@@ -169,14 +189,18 @@ void startPersistentAlarm(const String &subtext) {
   indtastetKode = "";
   tempMsgUntil = 0;
   digitalWrite(ledPinG, LOW);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print("ALARM ACTIVE!");
-  lcd.setCursor(0, 1);
-  lcd.print(subtext.substring(0, 16));
+  tone(buzzerPin, 2200);
+  digitalWrite(ledPinR, HIGH);
+  sirenHigh = true;
+  lastSirenToggleMs = millis();
+  delay(20);
+  lcdWriteSafe("ALARM ACTIVE!", subtext);
 }
 
 void disarmLocalAlarm(const String &who) {
+  if (localTempHigh) {
+    tempAlarmMutedWhileHot = true;
+  }
   alarmActive = false;
   alarmPinBuf = "";
   wrongAttempts = 0;
@@ -184,13 +208,14 @@ void disarmLocalAlarm(const String &who) {
   digitalWrite(ledPinG, LOW);
   digitalWrite(ledPinR, HIGH);
   tone(buzzerPin, 1800, 150);
+  delay(15);
   showTempStatus("Alarm Disarmed", who, 2500);
   Serial.println("{\"type\":\"access_event\",\"event\":\"alarm_disarmed\"}");
 }
 
 void updateAlarmSiren(unsigned long nowMs) {
   if (!alarmActive) return;
-  maxPeakInInterval = 0; // Ignorér egen sirene på lydsensoren!
+  maxPeakInInterval = 0;
   if (nowMs - lastSirenToggleMs >= 220) {
     lastSirenToggleMs = nowMs;
     sirenHigh = !sirenHigh;
@@ -214,11 +239,8 @@ void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
   digitalWrite(ledPinR, LOW);
   digitalWrite(ledPinG, HIGH);
   tone(buzzerPin, 2500, 500);
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(l1.substring(0, 16));
-  lcd.setCursor(0, 1);
-  lcd.print(l2.substring(0, 16));
+  delay(15);
+  lcdWriteSafe(l1, l2);
   doorIsOpen = true;
   doorOpenUntil = millis() + ms;
   tempMsgUntil = 0;
@@ -241,20 +263,37 @@ void handleIncomingCommand(const String &line) {
     tone(buzzerPin, 900, 200);
     showTempStatus("Door Locked", "By Azure Admin", 2000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_lock\"}");
-  } else if (line.indexOf("\"fan_on\"") >= 0) {
-    fanManualOn = true;
-    int targetPwm = (fanPwmCurrent > FAN_PWM_PREVENTIVE) ? fanPwmCurrent : FAN_PWM_PREVENTIVE;
-    setFanSpeed(targetPwm);
+  } else if (line.indexOf("\"fan_auto_off\"") >= 0) {
+    fanAutoOn = false;
+    syncFanState();
+    if (!alarmActive && !fanActive) {
+      showTempStatus("AI Cooling: OFF", "Temp normal", 2500);
+    }
+  } else if (line.indexOf("\"fan_auto\"") >= 0) {
+    fanAutoOn = true;
+    syncFanState();
     if (!alarmActive) {
       tone(buzzerPin, 1400, 120);
-      showTempStatus("Cooling: ON", "Azure / AI Auto", 3000);
+      delay(15);
+      showTempStatus("AI Cooling: ON", "Preventive Fan", 2500);
+    }
+  } else if (line.indexOf("\"fan_on\"") >= 0) {
+    fanManualOn = true;
+    syncFanState();
+    if (!alarmActive) {
+      tone(buzzerPin, 1400, 120);
+      delay(15);
+      showTempStatus("Cooling: ON", "Manual Remote", 2500);
     }
   } else if (line.indexOf("\"fan_off\"") >= 0) {
     fanManualOn = false;
+    fanAutoOn = false;
+    localTempHigh = false;
     setFanSpeed(0);
     if (!alarmActive) {
       tone(buzzerPin, 900, 120);
-      showTempStatus("Cooling: OFF", "Normal mode", 3000);
+      delay(15);
+      showTempStatus("Cooling: OFF", "Normal mode", 2500);
     }
   } else if (line.indexOf("\"ping\"") >= 0) {
     if (!alarmActive) {
@@ -264,9 +303,10 @@ void handleIncomingCommand(const String &line) {
   } else if (line.indexOf("\"reset_state\"") >= 0) {
     wrongAttempts = 0;
     fanManualOn = false;
-    tempOverheatLatched = false;
+    fanAutoOn = false;
+    localTempHigh = false;
+    tempAlarmMutedWhileHot = false;
     setFanSpeed(0);
-    lcd.begin(16, 2);
     resetToLocked();
     tone(buzzerPin, 1500, 100);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_reset\"}");
@@ -301,7 +341,6 @@ void setup() {
   pinMode(fanPin, OUTPUT);
   analogWrite(fanPin, 0);
 
-  lcd.begin(16, 2);
   resetToLocked();
 }
 
@@ -311,10 +350,9 @@ void loop() {
   // 0. Lyt altid efter fjernstyring fra Raspberry Pi / Azure
   checkSerialFromPi();
 
-  // Hold non-blocking sirene i gang hvis alarm er aktiv
+  // Hold non-blocking sirene i gang - kræver ALTID PIN 1984# eller Azure alarm_stop!
   if (alarmActive) {
     updateAlarmSiren(currentMillis);
-    // Tillad fysisk afstilling via 1984# på keypaden mens sirenen hyler!
     char ak = customKeypad.getKey();
     if (ak) {
       if (ak == '#') {
@@ -322,23 +360,19 @@ void loop() {
           disarmLocalAlarm("By Local PIN");
         } else {
           alarmPinBuf = "";
-          lcd.setCursor(0, 1);
-          lcd.print("Wrong PIN!      ");
+          lcdWriteSafe("ALARM ACTIVE!", "Wrong PIN!");
         }
       } else if (ak == '*') {
         alarmPinBuf = "";
-        lcd.setCursor(0, 1);
-        lcd.print("PIN:            ");
+        lcdWriteSafe("ALARM ACTIVE!", "PIN: ");
       } else if (alarmPinBuf.length() < 4) {
         alarmPinBuf += ak;
-        lcd.setCursor(0, 1);
-        lcd.print("PIN: ");
-        for (unsigned int i = 0; i < alarmPinBuf.length(); i++) lcd.print("*");
-        lcd.print("       ");
+        String mask = "PIN: ";
+        for (unsigned int i = 0; i < alarmPinBuf.length(); i++) mask += "*";
+        lcdWriteSafe("ALARM ACTIVE!", mask);
       }
     }
   } else {
-    // Automatisk tilbagevenden til laast startskaerm
     if (doorIsOpen && currentMillis >= doorOpenUntil) {
       resetToLocked();
     }
@@ -364,7 +398,7 @@ void loop() {
     if (peakToPeak > maxPeakInInterval) maxPeakInInterval = peakToPeak;
   }
 
-  // --- 2. Mål DHT22, tjek lokal overophedning og send JSON telemetri hvert 10. sek ---
+  // --- 2. Mål DHT22, auto-styr KUN blæseren ved nedkøling, og send JSON hvert 10. sek ---
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
 
@@ -383,18 +417,25 @@ void loop() {
       tempVal = mySensor.getTemperature();
       humVal = mySensor.getHumidity();
 
-      // Lokal Edge Fail-Safe: Ved overophedning (>= 27.0 C) tænd blæser + alarm med det samme!
+      // Lokal Edge Fail-Safe:
+      // >= 27.0 C -> start blæser + låst alarm (kræver manuel afstilling!)
+      // < 27.0 C  -> stopper KUN blæseren automatisk (alarmen forbliver aktiv til manuelt stop!)
       if (tempVal >= TEMP_MAX_THRESHOLD) {
-        if (!tempOverheatLatched) {
-          tempOverheatLatched = true;
-          setFanSpeed(FAN_PWM_CRITICAL);
-          startPersistentAlarm("OVERHEAT! >27C");
-          Serial.println("{\"type\":\"access_event\",\"event\":\"local_overheat_alarm\"}");
+        if (!localTempHigh) {
+          localTempHigh = true;
+          fanAutoOn = true;
+          syncFanState();
+          if (!tempAlarmMutedWhileHot) {
+            startPersistentAlarm("OVERHEAT! >27C");
+            Serial.println("{\"type\":\"access_event\",\"event\":\"local_overheat_alarm\"}");
+          }
         }
-      } else if (tempVal <= TEMP_RESET_THRESHOLD && tempOverheatLatched) {
-        tempOverheatLatched = false;
-        if (!fanManualOn) {
-          setFanSpeed(0);
+      } else {
+        tempAlarmMutedWhileHot = false;
+        if (localTempHigh) {
+          localTempHigh = false;
+          fanAutoOn = false;
+          syncFanState();
           if (!alarmActive && !doorIsOpen && !kortGodkendt) visStartSkaerm();
         }
       }
@@ -425,21 +466,15 @@ void loop() {
         if (tjekUID()) {
           tone(buzzerPin, 2000, 200);
           kortGodkendt = true;
-          lcd.clear();
-          lcd.setCursor(1, 0);
-          lcd.print("Card Accepted!");
+          lcdWriteSafe(" Card Accepted!", "");
           delay(1000);
-          lcd.clear();
-          lcd.setCursor(2, 0);
-          lcd.print("Enter Code");
+          lcdWriteSafe("   Enter Code", "");
         } else {
           tone(buzzerPin, 300, 500);
           Serial.print("{\"type\":\"access_request\",\"credential\":\"");
           Serial.print(senesteUID);
           Serial.println("\",\"method\":\"rfid_invalid\"}");
-          lcd.clear();
-          lcd.setCursor(1, 0);
-          lcd.print("Invalid Card!");
+          lcdWriteSafe(" Invalid Card!", "");
           delay(2000);
           visStartSkaerm();
         }
@@ -462,11 +497,7 @@ void loop() {
           } else {
             wrongAttempts++;
             tone(buzzerPin, 400, 300);
-            lcd.clear();
-            lcd.setCursor(1, 0);
-            lcd.print("Wrong Code!");
-            lcd.setCursor(2, 1);
-            lcd.print("Attempts: "); lcd.print(wrongAttempts);
+            lcdWriteSafe("  Wrong Code!", "  Attempts: " + String(wrongAttempts));
             delay(2000);
 
             if (wrongAttempts >= maxAttempts) {
@@ -475,21 +506,19 @@ void loop() {
               startPersistentAlarm("Enter PIN / Web");
             } else {
               digitalWrite(ledPinR, HIGH);
-              lcd.clear();
-              lcd.setCursor(2, 0);
-              lcd.print("Enter Code");
+              lcdWriteSafe("   Enter Code", "");
             }
           }
           indtastetKode = "";
         } else if (key == '*') {
           indtastetKode = "";
-          lcd.setCursor(0, 1);
-          lcd.print("                ");
+          lcdWriteSafe("   Enter Code", "");
         } else {
           if (indtastetKode.length() < 4) {
             indtastetKode += key;
-            lcd.setCursor(6 + indtastetKode.length() - 1, 1);
-            lcd.print("*");
+            String mask = "      ";
+            for (unsigned int i = 0; i < indtastetKode.length(); i++) mask += "*";
+            lcdWriteSafe("   Enter Code", mask);
           }
         }
       }
