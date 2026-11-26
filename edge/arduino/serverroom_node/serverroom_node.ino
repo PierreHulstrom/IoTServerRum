@@ -1,5 +1,5 @@
 /* =========================================================================
- * Biblioteker (100 % identiske med original 3_Semester_IOT.ino)
+ * Serverrum IoT – Elegoo / Arduino Mega 2560 (Azure + Pi + Lokal 2FA)
  * ========================================================================= */
 #include <Keypad.h>
 #include <dhtnew.h>
@@ -10,9 +10,9 @@
 #include <MFRC522.h>
 
 /* =========================================================================
- * Hardware & Sensorer (100 % originale pins – INGEN ledninger aendret!)
+ * Hardware & Sensorer (Holdets fysiske pins – nul konflikter!)
  * ========================================================================= */
-#define RST_PIN 9
+#define RST_PIN 5
 #define SS_PIN  53
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
@@ -49,7 +49,7 @@ byte rowPins[ROWS] = {31, 33, 35, 37};
 byte colPins[COLS] = {39, 41, 43, 45};
 Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
 
-// DS3231 RTC-modul (I2C)
+// DS3231 RTC-modul (I2C: Pin 20/21)
 RTC_DS3231 rtc;
 bool rtcOk = false;
 
@@ -64,9 +64,17 @@ const int maxAttempts = 3;
 
 bool doorIsOpen = false;
 unsigned long doorOpenUntil = 0;
+unsigned long tempMsgUntil = 0;
 String serialBuf = "";
 
 // --- HJÆLPEFUNKTIONER ---
+void wakeRfid() {
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, HIGH);
+  delay(5);
+  mfrc522.PCD_Init();
+}
+
 String getRtcString() {
   if (!rtcOk) return "no_rtc";
   DateTime now = rtc.now();
@@ -92,6 +100,140 @@ void visStartSkaerm() {
   lcd.print("Scan Card");
   lcd.setCursor(4, 1);
   lcd.print("To Start");
+  wakeRfid();
+}
+
+void showTempStatus(const String &l1, const String &l2, unsigned long ms) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(l1.substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd
+cat << 'EOF' > /opt/serverroom-iot/edge/arduino/serverroom_node/serverroom_node.ino
+/* =========================================================================
+ * Serverrum IoT – Elegoo / Arduino Mega 2560 (Azure + Pi + Lokal 2FA)
+ * ========================================================================= */
+#include <Keypad.h>
+#include <dhtnew.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <LiquidCrystal.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+/* =========================================================================
+ * Hardware & Sensorer (Holdets fysiske pins – nul konflikter!)
+ * ========================================================================= */
+#define RST_PIN 5
+#define SS_PIN  53
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+
+byte gyldigUID[] = { 0xF1, 0xEF, 0xBE, 0x53 };
+
+// DHT22 Sensor (Digital Pin 48)
+DHTNEW mySensor(48);
+
+// Lydsensor (Analog udgang A0)
+const int soundAnalogPin = A0;
+const int sampleWindow = 50;
+unsigned long previousSensorMillis = 0;
+const unsigned long sensorInterval = 10000;
+unsigned int maxPeakInInterval = 0;
+
+// LED og Buzzer pins
+const int ledPinG = 2;
+const int ledPinR = 22;
+const int buzzerPin = 24;
+
+// LCD: Ben 6, 7, 8, 9, 10, 11
+LiquidCrystal lcd(6, 7, 8, 9, 10, 11);
+
+// Keypad: Raekker (31, 33, 35, 37), Kolonner (39, 41, 43, 45)
+const byte ROWS = 4;
+const byte COLS = 4;
+char hexaKeys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {31, 33, 35, 37};
+byte colPins[COLS] = {39, 41, 43, 45};
+Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
+
+// DS3231 RTC-modul (I2C: Pin 20/21)
+RTC_DS3231 rtc;
+bool rtcOk = false;
+
+// Tilstand og pinkode
+bool kortGodkendt = false;
+String indtastetKode = "";
+String korrektKode = "1984";
+String senesteUID = "";
+
+int wrongAttempts = 0;
+const int maxAttempts = 3;
+
+bool doorIsOpen = false;
+unsigned long doorOpenUntil = 0;
+unsigned long tempMsgUntil = 0;
+String serialBuf = "";
+
+// --- HJÆLPEFUNKTIONER ---
+void wakeRfid() {
+  pinMode(RST_PIN, OUTPUT);
+  digitalWrite(RST_PIN, HIGH);
+  delay(5);
+  mfrc522.PCD_Init();
+}
+
+String getRtcString() {
+  if (!rtcOk) return "no_rtc";
+  DateTime now = rtc.now();
+  char buf[20];
+  snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
+           now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+  return String(buf);
+}
+
+String getUidHex() {
+  String uid = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
+    uid += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uid.toUpperCase();
+  return uid;
+}
+
+void visStartSkaerm() {
+  lcd.clear();
+  lcd.setCursor(3, 0);
+  lcd.print("Scan Card");
+  lcd.setCursor(4, 1);
+  lcd.print("To Start");
+  wakeRfid();
+}
+
+void showTempStatus(const String &l1, const String &l2, unsigned long ms) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(l1.substring(0, 16));
+  lcd.setCursor(0, 1);
+  lcd.print(l2.substring(0, 16));
+  tempMsgUntil = millis() + ms;
+  wakeRfid();
+}
+
+void resetToLocked() {
+  noTone(buzzerPin);
+  doorIsOpen = false;
+  kortGodkendt = false;
+  indtastetKode = "";
+  tempMsgUntil = 0;
+  digitalWrite(ledPinG, LOW);
+  digitalWrite(ledPinR, HIGH);
+  visStartSkaerm();
 }
 
 bool tjekUID() {
@@ -118,9 +260,7 @@ void triggerSiren(int loops) {
       delay(25);
     }
   }
-  noTone(buzzerPin);
-  digitalWrite(ledPinR, HIGH);
-  digitalWrite(ledPinG, LOW);
+  resetToLocked();
 }
 
 void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
@@ -135,6 +275,7 @@ void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
   lcd.print(l2.substring(0, 16));
   doorIsOpen = true;
   doorOpenUntil = millis() + ms;
+  tempMsgUntil = 0;
   wrongAttempts = 0;
   kortGodkendt = false;
   indtastetKode = "";
@@ -143,30 +284,29 @@ void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
 // --- MODTAG FJERNSTYRING FRA AZURE -> PI ---
 void handleIncomingCommand(const String &line) {
   if (line.indexOf("\"unlock_door\"") >= 0) {
-    openDoorNonBlocking("Remote Unlocked", "Serverroom open", 10000);
+    openDoorNonBlocking("Remote Unlocked", "Serverroom open", 8000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_unlock\"}");
   } else if (line.indexOf("\"lock_door\"") >= 0) {
-    doorIsOpen = false;
-    digitalWrite(ledPinR, HIGH);
-    digitalWrite(ledPinG, LOW);
     tone(buzzerPin, 600, 150);
-    visStartSkaerm();
+    resetToLocked();
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_lock\"}");
   } else if (line.indexOf("\"fan_on\"") >= 0) {
     tone(buzzerPin, 1400, 120);
-    lcd.clear();
-    lcd.setCursor(0, 0);
-    lcd.print("Cooling: ON");
-    lcd.setCursor(0, 1);
-    lcd.print("Azure / AI Auto");
+    showTempStatus("Cooling: ON", "Azure / AI Auto", 3000);
   } else if (line.indexOf("\"fan_off\"") >= 0) {
     tone(buzzerPin, 900, 120);
-    visStartSkaerm();
+    showTempStatus("Cooling: OFF", "Normal mode", 3000);
   } else if (line.indexOf("\"alarm_test\"") >= 0) {
     triggerSiren(6);
-    visStartSkaerm();
   } else if (line.indexOf("\"ping\"") >= 0) {
     tone(buzzerPin, 1800, 80);
+    showTempStatus("Azure Ping OK", getRtcString().substring(11), 2500);
+  } else if (line.indexOf("\"reset_state\"") >= 0) {
+    wrongAttempts = 0;
+    lcd.begin(16, 2);
+    resetToLocked();
+    tone(buzzerPin, 1500, 100);
+    Serial.println("{\"type\":\"access_event\",\"event\":\"remote_reset\"}");
   }
 }
 
@@ -186,7 +326,6 @@ void checkSerialFromPi() {
 void setup() {
   Serial.begin(115200);
   SPI.begin();
-  mfrc522.PCD_Init();
 
   rtcOk = rtc.begin();
   if (rtcOk && rtc.lostPower()) {
@@ -197,25 +336,22 @@ void setup() {
   pinMode(ledPinR, OUTPUT);
   pinMode(buzzerPin, OUTPUT);
 
-  digitalWrite(ledPinR, HIGH);
-  digitalWrite(ledPinG, LOW);
-  noTone(buzzerPin);
-
   lcd.begin(16, 2);
-  visStartSkaerm();
+  resetToLocked();
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 0. Lyt efter fjernstyring fra Raspberry Pi / Azure
+  // 0. Lyt altid efter fjernstyring fra Raspberry Pi / Azure
   checkSerialFromPi();
 
-  // Luk dør igen automatisk efter oplåsningstid (uden at blokere sensorer!)
+  // Automatisk tilbagevenden til laast startskaerm
   if (doorIsOpen && currentMillis >= doorOpenUntil) {
-    doorIsOpen = false;
-    digitalWrite(ledPinR, HIGH);
-    digitalWrite(ledPinG, LOW);
+    resetToLocked();
+  }
+  if (tempMsgUntil > 0 && currentMillis >= tempMsgUntil && !doorIsOpen && !kortGodkendt) {
+    tempMsgUntil = 0;
     visStartSkaerm();
   }
 
@@ -277,7 +413,6 @@ void loop() {
         lcd.print("Enter Code");
       } else {
         tone(buzzerPin, 300, 500);
-        // Log ugyldigt kort op til Azure
         Serial.print("{\"type\":\"access_request\",\"credential\":\"");
         Serial.print(senesteUID);
         Serial.println("\",\"method\":\"rfid_invalid\"}");
@@ -294,7 +429,6 @@ void loop() {
     char key = customKeypad.getKey();
     if (key) {
       if (key == '#') {
-        // Send adgangsforsøg op til Azure (opret F1EFBE53:1984 i dashboardet for grøn GODKENDT log!)
         Serial.print("{\"type\":\"access_request\",\"credential\":\"");
         Serial.print(senesteUID);
         Serial.print(":");
@@ -316,10 +450,8 @@ void loop() {
 
           if (wrongAttempts >= maxAttempts) {
             Serial.println("{\"type\":\"access_event\",\"event\":\"local_bruteforce_alarm\"}");
-            triggerSiren(15);
             wrongAttempts = 0;
-            kortGodkendt = false;
-            visStartSkaerm();
+            triggerSiren(15);
           } else {
             digitalWrite(ledPinR, HIGH);
             lcd.clear();
