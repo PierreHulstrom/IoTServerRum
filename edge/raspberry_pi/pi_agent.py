@@ -107,14 +107,14 @@ class PiBridge:
 
     def _on_message(self, client, userdata, msg):
         raw = msg.payload.decode("utf-8", errors="ignore")
-        print(f"\n[AZURE -> PI] Topic: {msg.topic} | Besked: {raw}")
+        print(f"[AZURE -> PI] Topic: {msg.topic} | Besked: {raw}", flush=True)
         try:
             data = json.loads(raw)
         except Exception:
             return
 
         if msg.topic == f"serverroom/{DEVICE_ID}/cmd":
-            out = {"type": "cmd", "command": data.get("command"), "payload": data.get("payload", {})}
+            out = {"cmd": data.get("command")}
             self._send_to_arduino(out)
         elif msg.topic == "serverroom/access/response":
             out = {
@@ -126,10 +126,11 @@ class PiBridge:
             self._send_to_arduino(out)
 
     def _send_to_arduino(self, obj: dict):
-        line = json.dumps(obj) + "\n"
+        line = json.dumps(obj, separators=(",", ":")) + "\n"
         if self.ser and self.ser.is_open:
             self.ser.write(line.encode("utf-8"))
-            print(f"[PI -> ARDUINO] {line.strip()}")
+            self.ser.flush()
+            print(f"[PI -> ARDUINO] {line.strip()}", flush=True)
         else:
             print(f"[SIMULERET ARDUINO] Udfører: {line.strip()}")
 
