@@ -15,18 +15,22 @@ def analyze_reading(device_id: str, temp, hum, noise):
     anomaly_score = 0.0
     predicted_critical_min = None
     critical_action_needed = False
+    threshold_breached = False
 
     # 1. Hårde serverrums-grænser (ASHRAE)
     if temp is not None and (temp > TEMP_MAX or temp < TEMP_MIN):
         is_anomaly = True
+        threshold_breached = True
         reasons.append(f"Temperatur uden for ASHRAE-grænse ({temp:.1f} °C)")
         if temp > TEMP_MAX:
             critical_action_needed = True
     if hum is not None and (hum > HUM_MAX or hum < HUM_MIN):
         is_anomaly = True
+        threshold_breached = True
         reasons.append(f"Luftfugtighed uden for grænse ({hum:.1f} %)")
     if noise is not None and noise > NOISE_MAX:
         is_anomaly = True
+        threshold_breached = True
         reasons.append(f"Højt støjniveau ({noise:.1f} dB)")
 
     # 2. Hent historik til flatline-tjek, AI-model & trendforudsigelse
@@ -128,5 +132,6 @@ def analyze_reading(device_id: str, temp, hum, noise):
         "anomaly_score": anomaly_score,
         "predicted_critical_min": predicted_critical_min,
         "critical_action_needed": critical_action_needed,
+        "threshold_breached": threshold_breached,
         "reasons": reasons,
     }

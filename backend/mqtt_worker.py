@@ -90,17 +90,27 @@ def _handle_telemetry(device_id: str, payload: dict):
     update_device_status(device_id, "online", {"zone": zone})
     ai_res = analyze_reading(device_id, temp, hum, noise)
 
-    # Autonom Closed-Loop AI -> Fjernstyring (med 60s cooldown)
-    if _auto_cooling_enabled and ai_res.get("critical_action_needed"):
+    # Autonom 2-trins Closed-Loop AI -> Fjernstyring (med 60s cooldown)
+    if _auto_cooling_enabled:
         now = time.time()
-        if now - _last_auto_action_ts.get(device_id, 0) >= 60:
-            _last_auto_action_ts[device_id] = now
-            publish_command(
-                device_id,
-                "fan_on",
-                {"reason": "ai_auto_protection", "temp": temp},
-                issued_by="ai_autopilot",
-            )
+        if ai_res.get("threshold_breached"):
+            if now - _last_auto_action_ts.get(device_id, 0) >= 60:
+                _last_auto_action_ts[device_id] = now
+                publish_command(
+                    device_id,
+                    "alarm_test",
+                    {"reason": "ashrae_threshold_breached", "temp": temp, "hum": hum, "noise": noise},
+                    issued_by="ai_autopilot",
+                )
+        elif ai_res.get("critical_action_needed"):
+            if now - _last_auto_action_ts.get(device_id, 0) >= 60:
+                _last_auto_action_ts[device_id] = now
+                publish_command(
+                    device_id,
+                    "fan_on",
+                    {"reason": "ai_auto_protection", "temp": temp},
+                    issued_by="ai_autopilot",
+                )
 
 
 def _handle_status(device_id: str, raw_text: str):

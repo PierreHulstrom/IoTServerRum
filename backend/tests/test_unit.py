@@ -229,7 +229,52 @@ class TestHardeningAndAutomation(unittest.TestCase):
             mock_pub.assert_called_once()
             self.assertEqual(mock_pub.call_args[0][1], "fan_on")
 
+
+    def test_ai_autopilot_triggers_alarm_on_threshold_breach(self):
+        mqtt_worker._last_auto_action_ts.clear()
+        mqtt_worker.set_auto_cooling(True)
+        conn, _ = make_mock_conn(fetchall_val=[])
+        with patch("mqtt_worker.get_conn", return_value=conn), \
+             patch("mqtt_worker.update_device_status"), \
+             patch("mqtt_worker.analyze_reading", return_value={"threshold_breached": True, "critical_action_needed": False}), \
+             patch("mqtt_worker.publish_command") as mock_pub:
+            mqtt_worker._handle_telemetry("pi1", {"temperature": 22.0, "humidity": 86.0, "noise_db": 50.0})
+            mock_pub.assert_called_once()
+            self.assertEqual(mock_pub.call_args[0][1], "alarm_test")
+
     def test_server_metrics_returns_valid_fields(self):
         m = main.get_server_metrics()
         for k in ("cpu_load", "ram_pct", "disk_pct", "uptime"):
             self.assertIn(k, m)
+
+
+class TestRBACAndUsers(unittest.TestCase):
+    def test_pbkdf2_password_hash_and_verify(self):
+        import auth_utils
+        h1 = auth_utils.hash_password("Hemmeligt123!")
+        h2 = auth_utils.hash_password("Hemmeligt123!")
+        self.assertNotEqual(h1, h2)  # Unik random salt hver gang
+        self.assertNotIn("Hemmeligt123!", h1)
+        self.assertTrue(auth_utils.verify_password("Hemmeligt123!", h1))
+        self.assertFalse(auth_utils.verify_password("Forkert123!", h1))
+
+    def test_rbac_viewer_blocked_from_commands(self):
+        dep = main.require_role("admin", "operator")
+        with self.assertRaises(HTTPException) as ctx:
+            dep({"username": "censor", "role": "viewer"})
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_rbac_operator_blocked_from_admin_user_mgmt(self):
+        dep = main.require_role("admin")
+        with self.assertRaises(HTTPException) as ctx:
+            dep({"username": "op1", "role": "operator"})
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_disabled_user_blocked_at_login(self):
+        import auth_utils
+        pw_hash = auth_utils.hash_password("StaerktPass99!")
+        conn, _ = make_mock_conn(
+            fetchone_val={"id": 2, "username": "spaerret", "password_hash": pw_hash, "role": "operator", "is_active": False}
+        )
+        with patch("auth_utils.get_conn", return_value=conn):
+            self.assertIsNone(auth_utils.authenticate_user("spaerret", "StaerktPass99!"))
