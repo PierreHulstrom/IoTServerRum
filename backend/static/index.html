@@ -95,6 +95,19 @@
     </header>
 
     <main>
+      <section class="card" style="display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;padding:10px 16px">
+        <div class="form-inline" style="margin:0">
+          <label style="align-self:center;color:var(--muted);font-size:0.85rem">Vis sensor-modul:</label>
+          <select id="dev-filter" onchange="refresh()">
+            <option value="all">Alle moduler</option>
+          </select>
+        </div>
+        <div class="btn-row" style="margin:0">
+          <button class="sec" onclick="downloadCsv('/api/export/sensors.csv','serverroom_sensors.csv')">⬇️ Sensordata (CSV)</button>
+          <button class="sec" onclick="downloadCsv('/api/export/anomalies.csv','serverroom_ai_anomalies.csv')">⬇️ AI-alarmer (CSV)</button>
+        </div>
+      </section>
+
       <section class="kpis">
         <div class="card">
           <div class="kpi-label">Temperatur (ASHRAE 18–27 °C)</div>
@@ -307,7 +320,8 @@
 
     async function refresh() {
       try {
-        const d = await api("/api/overview");
+        const selDev = document.getElementById("dev-filter")?.value || "all";
+        const d = await api("/api/overview?device_id=" + encodeURIComponent(selDev));
         const pm = document.getElementById("p-mqtt");
         pm.textContent = "MQTT: " + (d.health.mqtt ? "ONLINE" : "OFFLINE");
         pm.className = "pill " + (d.health.mqtt ? "ok" : "err");
@@ -373,6 +387,15 @@
           document.getElementById("k-ai-sub").textContent = `${a.time}: ${a.message}`;
         }
 
+        const selEl = document.getElementById("dev-filter");
+        if (selEl) {
+          const cur = selEl.value || "all";
+          const opts = ['<option value="all">Alle moduler</option>'].concat(
+            d.devices.map(x => `<option value="${esc(x.device_id)}">${esc(x.device_id)} (${esc(x.status)})</option>`)
+          );
+          selEl.innerHTML = opts.join("");
+          selEl.value = Array.from(selEl.options).some(o => o.value === cur) ? cur : "all";
+        }
         document.getElementById("t-devs").innerHTML = d.devices.map(x =>
           `<tr><td>${esc(x.device_id)}</td><td><span class="pill ${x.status==='online'?'ok':'err'}">${esc(x.status.toUpperCase())}</span></td><td>${esc(x.last_seen)}</td></tr>`
         ).join("") || '<tr><td colspan="3" style="color:var(--muted)">Ingen enheder forbundet endnu</td></tr>';
@@ -466,6 +489,20 @@
     async function delCard(id) {
       await api(`/api/access/cards/${id}`, { method: "DELETE" });
       refresh();
+    }
+
+    async function downloadCsv(url, filename) {
+      const sel = document.getElementById("dev-filter")?.value || "all";
+      const fullUrl = url.includes("sensors") ? `${url}?device_id=${encodeURIComponent(sel)}` : url;
+      const res = await fetch(fullUrl, { headers: { Authorization: "Bearer " + token } });
+      if (!res.ok) { showToast("Kunne ikke eksportere CSV"); return; }
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      showToast("Downloadet " + filename);
     }
 
     function startApp() {

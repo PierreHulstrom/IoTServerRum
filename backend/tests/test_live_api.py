@@ -100,3 +100,18 @@ class TestLiveRateLimit(unittest.TestCase):
             codes.append(c)
         self.assertEqual(codes[:5], [401, 401, 401, 401, 401])
         self.assertEqual(codes[5], 429)
+
+
+class TestLiveCSVExport(unittest.TestCase):
+    def test_09_csv_export_blocked_without_login(self):
+        c, _, _ = req(f"{BASE_LOCAL}/api/export/sensors.csv")
+        self.assertEqual(c, 401)
+
+    def test_10_csv_export_returns_valid_csv_with_headers(self):
+        c, _, body = req(f"{BASE_LOCAL}/api/login", method="POST", body={"username": USER, "password": PASS})
+        self.assertEqual(c, 200)
+        tok = json.loads(body)["token"]
+        c2, hdrs, csv_body = req(f"{BASE_LOCAL}/api/export/sensors.csv", headers={"Authorization": f"Bearer {tok}"})
+        self.assertEqual(c2, 200)
+        self.assertIn("text/csv", {k.lower(): v for k, v in hdrs.items()}.get("content-type", ""))
+        self.assertIn("time,device_id,zone,temperature,humidity,noise_db", csv_body)

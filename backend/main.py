@@ -1,4 +1,6 @@
 import base64
+import csv
+import io
 import hashlib
 import hmac
 import json
@@ -8,7 +10,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -215,17 +217,30 @@ def login(req: LoginReq, request: Request):
 
 
 @app.get("/api/overview")
-def overview(session: dict = Depends(verify_session)):
+def overview(device_id: str | None = None, session: dict = Depends(verify_session)):
+    dev_filter = device_id.strip() if device_id and device_id.strip() not in ("", "all") else None
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
-                       device_id, zone, temperature, humidity, noise_db
-                FROM sensor_readings
-                ORDER BY id DESC LIMIT 60
-                """
-            )
+            if dev_filter:
+                cur.execute(
+                    """
+                    SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
+                           device_id, zone, temperature, humidity, noise_db
+                    FROM sensor_readings
+                    WHERE device_id = %s
+                    ORDER BY id DESC LIMIT 60
+                    """,
+                    (dev_filter,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
+                           device_id, zone, temperature, humidity, noise_db
+                    FROM sensor_readings
+                    ORDER BY id DESC LIMIT 60
+                    """
+                )
             readings = list(reversed(cur.fetchall()))
 
             cur.execute(
@@ -397,3 +412,65 @@ def delete_dashboard_user(user_id: int, session: dict = Depends(require_role("ad
             cur.execute("DELETE FROM dashboard_users WHERE id = %s", (user_id,))
     log_system("auth", "WARNING", f"Bruger '{row['username']}' slettet af {session['username']}")
     return {"status": "deleted"}
+
+
+@app.get("/api/export/sensors.csv")
+def export_sensors_csv(device_id: str | None = None, session: dict = Depends(verify_session)):
+    dev_filter = device_id.strip() if device_id and device_id.strip() not in ("", "all") else None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if dev_filter:
+                cur.execute(
+                    """
+                    SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
+                           device_id, zone, temperature, humidity, noise_db
+                    FROM sensor_readings WHERE device_id = %s
+                    ORDER BY id DESC LIMIT 5000
+                    """,
+                    (dev_filter,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
+                           device_id, zone, temperature, humidity, noise_db
+                    FROM sensor_readings ORDER BY id DESC LIMIT 5000
+                    """
+                )
+            rows = list(reversed(cur.fetchall()))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["time", "device_id", "zone", "temperature", "humidity", "noise_db"])
+    for r in rows:
+        w.writerow([r["time"], r["device_id"], r["zone"], r["temperature"], r["humidity"], r["noise_db"]])
+    log_system("export", "INFO", f"Sensordata CSV eksporteret ({len(rows)} rækker) af {session['username']}")
+    return Response(
+        content="﻿" + buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=serverroom_sensors.csv"},
+    )
+
+
+@app.get("/api/export/anomalies.csv")
+def export_anomalies_csv(session: dict = Depends(verify_session)):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
+                       device_id, anomaly_score, is_anomaly, predicted_critical_min, message
+                FROM ai_anomalies ORDER BY id DESC LIMIT 2000
+                """
+            )
+            rows = list(reversed(cur.fetchall()))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["time", "device_id", "anomaly_score", "is_anomaly", "predicted_critical_min", "message"])
+    for r in rows:
+        w.writerow([r["time"], r["device_id"], r["anomaly_score"], r["is_anomaly"], r["predicted_critical_min"], r["message"]])
+    log_system("export", "INFO", f"AI-alarmer CSV eksporteret ({len(rows)} rækker) af {session['username']}")
+    return Response(
+        content="﻿" + buf.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=serverroom_ai_anomalies.csv"},
+    )
