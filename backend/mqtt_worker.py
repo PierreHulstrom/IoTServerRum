@@ -96,8 +96,7 @@ def _handle_telemetry(device_id: str, payload: dict):
         send_alert_async(
             f"ashrae:{device_id}",
             f"Kritisk serverrumsalarm på {device_id}",
-            f"ASHRAE-grænseværdi overskredet på {device_id}!
-Temp: {temp} C | Fugt: {hum} % | Støj: {noise} dB",
+            f"ASHRAE-grænseværdi overskredet på {device_id}!\nTemp: {temp} C | Fugt: {hum} % | Støj: {noise} dB",
             severity="CRITICAL",
             cooldown_sec=300,
         )
