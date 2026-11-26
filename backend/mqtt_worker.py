@@ -1,3 +1,13 @@
+"""MQTT worker bridging Mosquitto broker, MariaDB, AI engine, Azure Email, and edge nodes.
+
+Responsibilities:
+  - Ingest sensor telemetry and run the 4+1-layer AI engine on every reading.
+  - Execute 2-stage autonomous AI protection (latched alarm on breach; auto fan on/off).
+  - Verify physical RFID/PIN access requests against SHA-256 hashes + brute-force alarm.
+  - Monitor edge device liveness via LWT and a 60-second heartbeat watchdog.
+  - Enforce GDPR data retention (hourly cleanup of old sensor readings and access logs).
+"""
+
 import hashlib
 import json
 import os
@@ -9,44 +19,50 @@ from db import get_conn
 from emailer import send_alert_async
 from ai_engine import analyze_reading
 
+# Internal Docker Mosquitto connection settings
 MQTT_HOST = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USER = os.getenv("MQTT_BACKEND_USER", "backend")
 MQTT_PASS = os.getenv("MQTT_BACKEND_PASS", "")
 
+# GDPR retention windows (days)
 RETENTION_SENSOR_DAYS = int(os.getenv("RETENTION_SENSOR_DAYS", "30"))
 RETENTION_ACCESS_DAYS = int(os.getenv("RETENTION_ACCESS_DAYS", "90"))
 
 _client = None
 _connected = False
 
-# Indstilling for autonom AI -> fjernstyring (kan skiftes live i dashboardet)
+# Autonomous AI autopilot state (toggleable live from the dashboard)
 _auto_cooling_enabled = True
 _last_auto_action_ts: dict[str, float] = {}
 _active_env_alarm: dict[str, bool] = {}
 _active_auto_fan: dict[str, bool] = {}
 
-# Brute-force sporing for fysisk dørlæser (3 fejl inden for 60 sek -> alarm)
+# Physical door brute-force tracker: 3 denied attempts within 60 seconds triggers alarm
 _failed_access_attempts: dict[str, list[float]] = defaultdict(list)
 DOOR_BRUTEFORCE_LIMIT = 3
 DOOR_BRUTEFORCE_WINDOW_SEC = 60
 
 
 def get_auto_cooling() -> bool:
+    """Return True if autonomous AI cooling/alarm dispatch is currently enabled."""
     return _auto_cooling_enabled
 
 
 def set_auto_cooling(enabled: bool) -> bool:
+    """Toggle autonomous AI cooling/alarm dispatch on or off."""
     global _auto_cooling_enabled
     _auto_cooling_enabled = bool(enabled)
     return _auto_cooling_enabled
 
 
 def hash_credential(raw_value: str) -> str:
+    """Normalize and SHA-256 hash a physical RFID UID or 2FA UID:PIN credential."""
     return hashlib.sha256(raw_value.strip().encode("utf-8")).hexdigest()
 
 
 def log_system(source: str, level: str, message: str, details: dict | None = None):
+    """Write a structured audit/error event to system_logs without ever crashing the caller."""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -59,6 +75,7 @@ def log_system(source: str, level: str, message: str, details: dict | None = Non
 
 
 def update_device_status(device_id: str, status: str, meta: dict | None = None):
+    """Upsert an edge device's online/offline status and refresh its last_seen timestamp."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -75,11 +92,13 @@ def update_device_status(device_id: str, status: str, meta: dict | None = None):
 
 
 def _handle_telemetry(device_id: str, payload: dict):
+    """Store incoming telemetry, run AI anomaly detection, send alerts, and control cooling fan."""
     zone = str(payload.get("zone", "rack1"))
     temp = payload.get("temperature")
     hum = payload.get("humidity")
     noise = payload.get("noise_db")
 
+    # Persist raw sensor reading in MariaDB
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -93,7 +112,7 @@ def _handle_telemetry(device_id: str, payload: dict):
     update_device_status(device_id, "online", {"zone": zone})
     ai_res = analyze_reading(device_id, temp, hum, noise)
 
-    # Mail-advarsel ved kritisk ASHRAE-overskridelse (uanset auto-køling)
+    # Always send critical email alert on ASHRAE breach (even if auto-cooling is disabled)
     if ai_res.get("threshold_breached"):
         send_alert_async(
             f"ashrae:{device_id}",
@@ -103,9 +122,9 @@ def _handle_telemetry(device_id: str, payload: dict):
             cooldown_sec=300,
         )
 
-    # Autonom 2-trins Closed-Loop AI -> Fjernstyring:
-    # - Alarm (alarm_test) kræver ALTID manuel afstilling (PIN 1984# eller Dashboard kodeord)
-    # - Blæser (fan_auto / fan_auto_off) starter automatisk og stopper igen når temp < 27 C
+    # 2-stage autonomous AI closed-loop control (separate 60s cooldowns for alarm vs. fan):
+    # - alarm_test stays latched until manually disarmed (PIN 1984# or dashboard password)
+    # - fan_auto starts cooling on overheat/prediction and auto-stops via fan_auto_off when < 27 C
     if _auto_cooling_enabled:
         now = time.time()
         if ai_res.get("threshold_breached"):
@@ -140,7 +159,9 @@ def _handle_telemetry(device_id: str, payload: dict):
                 issued_by="ai_autopilot",
             )
 
+
 def _handle_status(device_id: str, raw_text: str):
+    """Handle MQTT heartbeat or Last Will & Testament (LWT) offline notifications."""
     try:
         data = json.loads(raw_text)
         status = str(data.get("status", "online")).lower()
@@ -162,6 +183,7 @@ def _handle_status(device_id: str, raw_text: str):
 
 
 def _handle_access_request(payload: dict):
+    """Verify a physical RFID/PIN request against SHA-256 hashes, log it, and detect brute-force."""
     device_id = str(payload.get("device_id", "pi1"))
     raw_cred = str(payload.get("credential", ""))
     cred_hash = hash_credential(raw_cred)
@@ -170,6 +192,7 @@ def _handle_access_request(payload: dict):
     owner_name = None
     reason = "Ukendt kort/kode"
 
+    # Look up hashed credential and record the access attempt in access_logs
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -193,6 +216,7 @@ def _handle_access_request(payload: dict):
                 (device_id, cred_hash[:16], owner_name, granted, reason),
             )
 
+    # Publish authorization decision back to the edge node
     response = {
         "device_id": device_id,
         "granted": granted,
@@ -208,7 +232,7 @@ def _handle_access_request(payload: dict):
         {"device_id": device_id, "granted": granted},
     )
 
-    # Fysisk brute-force detektion (3 afviste forsøg inden for 60 sek -> alarm!)
+    # Physical door brute-force detection: 3 denied attempts in 60s -> siren + critical email
     now = time.time()
     if granted:
         _failed_access_attempts[device_id].clear()
@@ -240,6 +264,7 @@ def _handle_access_request(payload: dict):
 
 
 def _on_connect(client, userdata, flags, reason_code, properties):
+    """Paho MQTT callback: subscribe to all serverroom/# topics once connected."""
     global _connected
     _connected = (reason_code == 0)
     print(f"[MQTT] Connected rc={reason_code}", flush=True)
@@ -248,12 +273,14 @@ def _on_connect(client, userdata, flags, reason_code, properties):
 
 
 def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+    """Paho MQTT callback: mark broker connection as offline."""
     global _connected
     _connected = False
     print(f"[MQTT] Disconnected rc={reason_code}", flush=True)
 
 
 def _on_message(client, userdata, msg):
+    """Route incoming MQTT topics to telemetry, status, access request, or door event handlers."""
     topic = msg.topic
     raw = msg.payload.decode("utf-8", errors="ignore")
     parts = topic.split("/")
@@ -271,6 +298,7 @@ def _on_message(client, userdata, msg):
 
 
 def _heartbeat_watchdog():
+    """Background thread: mark any device OFFLINE if no telemetry/heartbeat arrives for 60s."""
     while True:
         time.sleep(15)
         try:
@@ -292,7 +320,7 @@ def _heartbeat_watchdog():
 
 
 def run_gdpr_retention():
-    """GDPR-dataminimering: sletter forældede sensormålinger og personhenførbare adgangslogs."""
+    """GDPR data minimization: delete sensor readings >30d and personal access logs >90d."""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -317,12 +345,14 @@ def run_gdpr_retention():
 
 
 def _retention_loop():
+    """Background thread: run GDPR cleanup once every hour."""
     while True:
         time.sleep(3600)
         run_gdpr_retention()
 
 
 def start_mqtt():
+    """Initialize the Paho MQTT client and spawn watchdog + GDPR retention background threads."""
     global _client
     _client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="serverroom-backend")
     _client.username_pw_set(MQTT_USER, MQTT_PASS)
@@ -338,10 +368,12 @@ def start_mqtt():
 
 
 def mqtt_is_connected() -> bool:
+    """Return True when the backend is connected to Mosquitto."""
     return _connected
 
 
 def publish_command(device_id: str, command: str, payload: dict, issued_by: str):
+    """Publish a command to serverroom/<device_id>/cmd and audit-log it in command_logs."""
     topic = f"serverroom/{device_id}/cmd"
     msg = {"command": command, "payload": payload, "issued_by": issued_by}
     if _client:

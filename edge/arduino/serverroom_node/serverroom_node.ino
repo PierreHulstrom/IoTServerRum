@@ -1,8 +1,14 @@
 /* =========================================================================
- * Serverrum IoT - Elegoo / Arduino Mega 2560
- * Azure MQTTS + Pi + Lokal 2FA + PWM Blæser (Pin 12) + LCD Anti-Glitch
- * - ALLE alarmer kræver manuel afstilling (PIN 1984# eller Azure kodeord)
- * - Blæser (Pin 12) starter ved AI-advarsel / >= 27 C og stopper selv under 27 C
+ * Server Room IoT - Elegoo / Arduino Mega 2560 Edge Node
+ *
+ * Capabilities:
+ * - Reads DHT22 (temp/humidity), analog sound sensor (peak-to-peak dB), and DS3231 RTC.
+ * - Sends JSON telemetry to Raspberry Pi -> Azure MQTTS every 10 seconds (115200 baud).
+ * - Local 2FA door access control: RC522 RFID card + 4x4 Keypad PIN ("1984#").
+ * - Persistent non-blocking alarm (ALL alarms require manual disarm via PIN 1984# or Azure).
+ * - PWM cooling fan on Pin 12 with soft-start (AI preventive + local >= 27 C fail-safe;
+ *   auto-stops when temp drops < 27 C; manual remote override from Dashboard).
+ * - HD44780 LCD auto-resync to prevent garbled characters after motor/buzzer power spikes.
  * ========================================================================= */
 #include <Keypad.h>
 #include <dhtnew.h>
@@ -12,36 +18,37 @@
 #include <SPI.h>
 #include <MFRC522.h>
 
-// Holdets fysiske pins (RC522 RST på Pin 5 - nul konflikt med LCD ben 6-11)
+// --- RFID-RC522 (SPI pins 50-53; RST on Pin 5 to avoid LCD pins 6-11) ---
 #define RST_PIN 5
 #define SS_PIN  53
 MFRC522 mfrc522(SS_PIN, RST_PIN);
 
+// Authorized local fallback RFID card UID
 byte gyldigUID[] = { 0xF1, 0xEF, 0xBE, 0x53 };
 
-// DHT22 (Pin 48) & Lydsensor (A0)
+// --- Environmental sensors: DHT22 (Pin 48) & Analog sound sensor (A0) ---
 DHTNEW mySensor(48);
 const int soundAnalogPin = A0;
-const int sampleWindow = 50;
+const int sampleWindow = 50;                 // Sound sampling window in ms
 unsigned long previousSensorMillis = 0;
-const unsigned long sensorInterval = 10000;
+const unsigned long sensorInterval = 10000;  // Telemetry interval: 10 seconds
 unsigned int maxPeakInInterval = 0;
 
-// LED, Buzzer og PWM-Blæser (Pin 12 - Timer 1, ingen konflikt med tone())
+// --- Actuators: Status LEDs, Passive Buzzer (Timer 2), PWM Fan (Pin 12, Timer 1) ---
 const int ledPinG = 2;
 const int ledPinR = 22;
 const int buzzerPin = 24;
 const int fanPin = 12;
 
-// Blæserhastigheder (0-255, justér frit) & ASHRAE-grænse
-const int FAN_PWM_PREVENTIVE = 90;       // Præventiv AI-køling / dashboard "Start blæser"
-const int FAN_PWM_CRITICAL   = 180;      // Kraftig køling ved overophedning >= 27.0 C
-const float TEMP_MAX_THRESHOLD = 27.0;   // ASHRAE TC 9.9 max temperatur
+// --- Cooling PWM speeds (0-255) & ASHRAE TC 9.9 max temperature ---
+const int FAN_PWM_PREVENTIVE = 90;       // Preventive AI cooling / manual dashboard "fan_on"
+const int FAN_PWM_CRITICAL   = 180;      // High-speed cooling when temp >= 27.0 C
+const float TEMP_MAX_THRESHOLD = 27.0;   // Overheating threshold in Celsius
 
-// LCD: Ben 6, 7, 8, 9, 10, 11
+// --- 16x2 LCD in 4-bit parallel mode (Pins 6-11) ---
 LiquidCrystal lcd(6, 7, 8, 9, 10, 11);
 
-// Keypad: Raekker (31, 33, 35, 37), Kolonner (39, 41, 43, 45)
+// --- 4x4 Matrix Keypad (Rows 31-37, Cols 39-45) ---
 const byte ROWS = 4;
 const byte COLS = 4;
 char hexaKeys[ROWS][COLS] = {
@@ -54,10 +61,11 @@ byte rowPins[ROWS] = {31, 33, 35, 37};
 byte colPins[COLS] = {39, 41, 43, 45};
 Keypad customKeypad = Keypad(makeKeymap(hexaKeys), rowPins, colPins, ROWS, COLS);
 
+// --- DS3231 Real-Time Clock (I2C pins 20/21) ---
 RTC_DS3231 rtc;
 bool rtcOk = false;
 
-// Adgangstilstande
+// --- Access control state ---
 bool kortGodkendt = false;
 String indtastetKode = "";
 String korrektKode = "1984";
@@ -69,23 +77,24 @@ bool doorIsOpen = false;
 unsigned long doorOpenUntil = 0;
 unsigned long tempMsgUntil = 0;
 
-// Blæser-tilstand (adskilt manuel vs. automatisk AI/DHT-styring)
+// --- Cooling fan state (separates manual dashboard control from automatic AI/DHT control) ---
 bool fanActive = false;
 int fanPwmCurrent = 0;
 bool fanManualOn = false;
 bool fanAutoOn = false;
 bool localTempHigh = false;
 
-// Vedvarende alarm (stopper KUN ved manuel PIN 1984# eller Azure alarm_stop!)
+// --- Persistent alarm state (ONLY stopped manually via PIN 1984# or Azure alarm_stop) ---
 bool alarmActive = false;
 bool tempAlarmMutedWhileHot = false;
 unsigned long lastSirenToggleMs = 0;
 bool sirenHigh = false;
 String alarmPinBuf = "";
 
+// Buffer for incoming newline-delimited JSON commands from Raspberry Pi
 String serialBuf = "";
 
-// --- LCD RESYNC (fjerner krøllede HD44780-tegn efter motor-/buzzer-spændingsdyk) ---
+// --- Re-initialize LCD before printing to clear any HD44780 4-bit glitches from power spikes ---
 void lcdWriteSafe(const String &l1, const String &l2) {
   lcd.begin(16, 2);
   delay(5);
@@ -96,7 +105,7 @@ void lcdWriteSafe(const String &l1, const String &l2) {
   lcd.print(l2.substring(0, 16));
 }
 
-// --- BLÆSERSTYRING MED SOFT-START (PWM PIN 12) ---
+// --- Set PWM fan speed on Pin 12 using a gentle soft-start ramp to prevent 5V rail dips ---
 void setFanSpeed(int pwm) {
   if (pwm <= 0) {
     analogWrite(fanPin, 0);
@@ -118,6 +127,7 @@ void setFanSpeed(int pwm) {
   fanPwmCurrent = pwm;
 }
 
+// --- Resolve final fan speed from local overheat, AI auto-cooling, and manual override flags ---
 void syncFanState() {
   if (localTempHigh) {
     setFanSpeed(FAN_PWM_CRITICAL);
@@ -128,7 +138,7 @@ void syncFanState() {
   }
 }
 
-// --- HJÆLPEFUNKTIONER ---
+// --- Re-initialize RC522 RFID reader after state transitions so card scans stay responsive ---
 void wakeRfid() {
   pinMode(RST_PIN, OUTPUT);
   digitalWrite(RST_PIN, HIGH);
@@ -136,6 +146,7 @@ void wakeRfid() {
   mfrc522.PCD_Init();
 }
 
+// --- Format current DS3231 RTC date/time as "YYYY-MM-DD HH:MM:SS" ---
 String getRtcString() {
   if (!rtcOk) return "no_rtc";
   DateTime now = rtc.now();
@@ -145,6 +156,7 @@ String getRtcString() {
   return String(buf);
 }
 
+// --- Convert the scanned RFID UID bytes to an uppercase hex string (e.g. "F1EFBE53") ---
 String getUidHex() {
   String uid = "";
   for (byte i = 0; i < mfrc522.uid.size; i++) {
@@ -155,17 +167,20 @@ String getUidHex() {
   return uid;
 }
 
+// --- Display idle welcome screen (also indicates when the cooling fan is running) ---
 void visStartSkaerm() {
   lcdWriteSafe("   Scan Card", fanActive ? "    Fan: ON" : "    To Start");
   wakeRfid();
 }
 
+// --- Show a temporary 2-line status message for `ms` milliseconds, then return to idle ---
 void showTempStatus(const String &l1, const String &l2, unsigned long ms) {
   lcdWriteSafe(l1, l2);
   tempMsgUntil = millis() + ms;
   wakeRfid();
 }
 
+// --- Return door and access state to locked (Red LED ON, Green LED OFF) ---
 void resetToLocked() {
   alarmActive = false;
   alarmPinBuf = "";
@@ -179,9 +194,9 @@ void resetToLocked() {
   visStartSkaerm();
 }
 
-// Vedvarende alarm - kræver ALTID manuel afstilling (PIN 1984# eller Azure kodeord)!
+// --- Start latched non-blocking alarm (stays active until PIN 1984# or Azure alarm_stop) ---
 void startPersistentAlarm(const String &subtext) {
-  if (alarmActive) return;
+  if (alarmActive) return;  // Already sounding: do not interrupt an ongoing keypad PIN entry
   alarmActive = true;
   alarmPinBuf = "";
   doorIsOpen = false;
@@ -189,6 +204,7 @@ void startPersistentAlarm(const String &subtext) {
   indtastetKode = "";
   tempMsgUntil = 0;
   digitalWrite(ledPinG, LOW);
+  // Start buzzer first, let 5V rail settle for 20ms, then resync LCD for clean text
   tone(buzzerPin, 2200);
   digitalWrite(ledPinR, HIGH);
   sirenHigh = true;
@@ -197,9 +213,10 @@ void startPersistentAlarm(const String &subtext) {
   lcdWriteSafe("ALARM ACTIVE!", subtext);
 }
 
+// --- Manually disarm active alarm (fan keeps cooling if temperature is still >= 27 C) ---
 void disarmLocalAlarm(const String &who) {
   if (localTempHigh) {
-    tempAlarmMutedWhileHot = true;
+    tempAlarmMutedWhileHot = true;  // Prevent immediate re-trigger while room is still cooling down
   }
   alarmActive = false;
   alarmPinBuf = "";
@@ -213,9 +230,10 @@ void disarmLocalAlarm(const String &who) {
   Serial.println("{\"type\":\"access_event\",\"event\":\"alarm_disarmed\"}");
 }
 
+// --- Toggle siren frequency (1200/2200 Hz) and Red LED every 220ms without blocking loop() ---
 void updateAlarmSiren(unsigned long nowMs) {
   if (!alarmActive) return;
-  maxPeakInInterval = 0;
+  maxPeakInInterval = 0;  // Ignore own siren on the sound sensor to prevent feedback loops
   if (nowMs - lastSirenToggleMs >= 220) {
     lastSirenToggleMs = nowMs;
     sirenHigh = !sirenHigh;
@@ -224,6 +242,7 @@ void updateAlarmSiren(unsigned long nowMs) {
   }
 }
 
+// --- Compare scanned 4-byte RFID UID against the local authorized card UID ---
 bool tjekUID() {
   if (mfrc522.uid.size != 4) return false;
   for (byte i = 0; i < 4; i++) {
@@ -232,6 +251,7 @@ bool tjekUID() {
   return true;
 }
 
+// --- Unlock door non-blocking (Green LED ON) for `ms` milliseconds, then auto-relock ---
 void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
   alarmActive = false;
   alarmPinBuf = "";
@@ -249,7 +269,7 @@ void openDoorNonBlocking(const String &l1, const String &l2, unsigned long ms) {
   indtastetKode = "";
 }
 
-// --- MODTAG FJERNSTYRING FRA AZURE -> PI ---
+// --- Execute compact JSON remote commands received from Azure -> Raspberry Pi ---
 void handleIncomingCommand(const String &line) {
   if (line.indexOf("\"alarm_stop\"") >= 0) {
     disarmLocalAlarm("By Azure Auth");
@@ -264,12 +284,14 @@ void handleIncomingCommand(const String &line) {
     showTempStatus("Door Locked", "By Azure Admin", 2000);
     Serial.println("{\"type\":\"access_event\",\"event\":\"remote_lock\"}");
   } else if (line.indexOf("\"fan_auto_off\"") >= 0) {
+    // AI reports normal temperature -> stop auto fan (keeps running if manually enabled)
     fanAutoOn = false;
     syncFanState();
     if (!alarmActive && !fanActive) {
       showTempStatus("AI Cooling: OFF", "Temp normal", 2500);
     }
   } else if (line.indexOf("\"fan_auto\"") >= 0) {
+    // AI predicts overheating or breach -> activate preventive cooling on Pin 12
     fanAutoOn = true;
     syncFanState();
     if (!alarmActive) {
@@ -278,6 +300,7 @@ void handleIncomingCommand(const String &line) {
       showTempStatus("AI Cooling: ON", "Preventive Fan", 2500);
     }
   } else if (line.indexOf("\"fan_on\"") >= 0) {
+    // Manual dashboard override: turn cooling fan ON
     fanManualOn = true;
     syncFanState();
     if (!alarmActive) {
@@ -286,6 +309,7 @@ void handleIncomingCommand(const String &line) {
       showTempStatus("Cooling: ON", "Manual Remote", 2500);
     }
   } else if (line.indexOf("\"fan_off\"") >= 0) {
+    // Manual dashboard override: force cooling fan OFF
     fanManualOn = false;
     fanAutoOn = false;
     localTempHigh = false;
@@ -301,6 +325,7 @@ void handleIncomingCommand(const String &line) {
       showTempStatus("Azure Ping OK", getRtcString().substring(11), 2500);
     }
   } else if (line.indexOf("\"reset_state\"") >= 0) {
+    // Full software reset of alarm, fan, and access states
     wrongAttempts = 0;
     fanManualOn = false;
     fanAutoOn = false;
@@ -313,6 +338,7 @@ void handleIncomingCommand(const String &line) {
   }
 }
 
+// --- Non-blocking USB Serial reader for newline-terminated commands from Raspberry Pi ---
 void checkSerialFromPi() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -326,6 +352,7 @@ void checkSerialFromPi() {
   }
 }
 
+// --- Arduino boot initialization ---
 void setup() {
   Serial.begin(115200);
   SPI.begin();
@@ -339,18 +366,19 @@ void setup() {
   pinMode(ledPinR, OUTPUT);
   pinMode(buzzerPin, OUTPUT);
   pinMode(fanPin, OUTPUT);
-  analogWrite(fanPin, 0);
+  analogWrite(fanPin, 0);  // Ensure fan starts OFF
 
   resetToLocked();
 }
 
+// --- Main non-blocking control loop ---
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 0. Lyt altid efter fjernstyring fra Raspberry Pi / Azure
+  // 0. Always check for incoming remote commands from Raspberry Pi / Azure
   checkSerialFromPi();
 
-  // Hold non-blocking sirene i gang - kræver ALTID PIN 1984# eller Azure alarm_stop!
+  // Handle active siren and allow local manual disarm via PIN 1984# on keypad
   if (alarmActive) {
     updateAlarmSiren(currentMillis);
     char ak = customKeypad.getKey();
@@ -373,6 +401,7 @@ void loop() {
       }
     }
   } else {
+    // Auto-relock door after open timeout and clear temporary LCD banners
     if (doorIsOpen && currentMillis >= doorOpenUntil) {
       resetToLocked();
     }
@@ -382,7 +411,7 @@ void loop() {
     }
   }
 
-  // --- 1. Lydsensor maaling (kun naar egen sirene ikke hyler) ---
+  // 1. Sample analog sound sensor peak-to-peak amplitude (skipped while own siren sounds)
   if (!alarmActive) {
     unsigned long startMillis = millis();
     unsigned int signalMax = 0;
@@ -398,10 +427,11 @@ void loop() {
     if (peakToPeak > maxPeakInInterval) maxPeakInInterval = peakToPeak;
   }
 
-  // --- 2. Mål DHT22, auto-styr KUN blæseren ved nedkøling, og send JSON hvert 10. sek ---
+  // 2. Every 10 seconds: read DHT22, enforce local overheat fail-safe, and emit JSON telemetry
   if (currentMillis - previousSensorMillis >= sensorInterval) {
     previousSensorMillis = currentMillis;
 
+    // Convert peak-to-peak ADC reading to estimated dB (clamped to 35-100 dB)
     double volts = (maxPeakInInterval * 5.0) / 1024.0;
     if (volts < 0.0005) volts = 0.0005;
     double estimateddB = 20.0 * log10(volts / 0.0005);
@@ -417,9 +447,9 @@ void loop() {
       tempVal = mySensor.getTemperature();
       humVal = mySensor.getHumidity();
 
-      // Lokal Edge Fail-Safe:
-      // >= 27.0 C -> start blæser + låst alarm (kræver manuel afstilling!)
-      // < 27.0 C  -> stopper KUN blæseren automatisk (alarmen forbliver aktiv til manuelt stop!)
+      // Local Edge Fail-Safe (works even if Wi-Fi/Azure drops):
+      // - temp >= 27.0 C -> start full-speed fan + latched alarm (requires manual disarm)
+      // - temp <  27.0 C -> auto-stop fan only (alarm stays active until manually disarmed)
       if (tempVal >= TEMP_MAX_THRESHOLD) {
         if (!localTempHigh) {
           localTempHigh = true;
@@ -441,6 +471,7 @@ void loop() {
       }
     }
 
+    // Stream JSON telemetry line to Raspberry Pi over USB Serial
     Serial.print("{\"type\":\"telemetry\",\"zone\":\"rack1\",\"temperature\":");
     if (dhtSuccess) Serial.print(tempVal, 2);
     else Serial.print("null");
@@ -458,7 +489,7 @@ void loop() {
     maxPeakInInterval = 0;
   }
 
-  // --- 3. Normal 2FA Adgangskontrol (naar alarm ikke er aktiv) ---
+  // 3. Normal physical 2FA access control (RFID card first, then 4-digit PIN + #)
   if (!alarmActive) {
     if (!kortGodkendt && !doorIsOpen) {
       if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial()) {
@@ -470,6 +501,7 @@ void loop() {
           delay(1000);
           lcdWriteSafe("   Enter Code", "");
         } else {
+          // Invalid RFID card: beep, log to Azure for brute-force tracking, and reset
           tone(buzzerPin, 300, 500);
           Serial.print("{\"type\":\"access_request\",\"credential\":\"");
           Serial.print(senesteUID);
@@ -485,6 +517,7 @@ void loop() {
       char key = customKeypad.getKey();
       if (key) {
         if (key == '#') {
+          // Send combined UID:PIN to Azure for centralized SHA-256 verification & audit logging
           Serial.print("{\"type\":\"access_request\",\"credential\":\"");
           Serial.print(senesteUID);
           Serial.print(":");
@@ -500,6 +533,7 @@ void loop() {
             lcdWriteSafe("  Wrong Code!", "  Attempts: " + String(wrongAttempts));
             delay(2000);
 
+            // 3 consecutive wrong PIN attempts -> trigger persistent intruder alarm
             if (wrongAttempts >= maxAttempts) {
               Serial.println("{\"type\":\"access_event\",\"event\":\"local_bruteforce_alarm\"}");
               wrongAttempts = 0;
@@ -511,6 +545,7 @@ void loop() {
           }
           indtastetKode = "";
         } else if (key == '*') {
+          // Clear current PIN entry
           indtastetKode = "";
           lcdWriteSafe("   Enter Code", "");
         } else {

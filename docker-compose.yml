@@ -1,4 +1,9 @@
+# Docker Compose stack for the Azure Server Room IoT platform
+# External ports exposed to host: ONLY 443 (HTTPS) and 8883 (MQTTS).
+# Ports 1883 (MQTT), 3306 (MariaDB), and 8000 (FastAPI) stay strictly internal to Docker.
+
 services:
+  # Eclipse Mosquitto MQTT broker (TLS 1.2+ on external 8883, plaintext internal 1883)
   mosquitto:
     image: eclipse-mosquitto:2
     container_name: serverroom-mosquitto
@@ -11,6 +16,7 @@ services:
       - ./mosquitto/data:/mosquitto/data
       - ./mosquitto/log:/mosquitto/log
 
+  # MariaDB 11 database (internal network only, persisted in named volume db_data)
   mariadb:
     image: mariadb:11
     container_name: serverroom-db
@@ -28,6 +34,7 @@ services:
       timeout: 5s
       retries: 5
 
+  # FastAPI backend + Hybrid AI engine + MQTT worker + Azure Email alerts
   backend:
     build: ./backend
     container_name: serverroom-backend
@@ -45,6 +52,7 @@ services:
       mosquitto:
         condition: service_started
 
+  # Caddy HTTPS reverse proxy (port 443 ONLY; port 80 stays closed)
   caddy:
     image: caddy:2-alpine
     container_name: serverroom-caddy

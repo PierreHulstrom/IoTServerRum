@@ -1,3 +1,5 @@
+"""Unit test suite for auth/RBAC, SHA-256 access control, 4+1-layer AI engine, and MQTT resilience."""
+
 import json
 import sys
 import time
@@ -14,6 +16,7 @@ import mqtt_worker
 
 
 def make_mock_conn(fetchall_val=None, fetchone_val=None):
+    """Build a mock MariaDB context-manager connection returning preset query results."""
     cur = MagicMock()
     cur.fetchall.return_value = fetchall_val if fetchall_val is not None else []
     cur.fetchone.return_value = fetchone_val
@@ -24,6 +27,8 @@ def make_mock_conn(fetchall_val=None, fetchone_val=None):
 
 
 class TestAuthAndTokens(unittest.TestCase):
+    """Verify HMAC-SHA256 bearer token issuance, tampering rejection, and expiry checks."""
+
     def test_valid_token_accepted(self):
         token = main.create_token("pierre")
         user = main.verify_token(f"Bearer {token}")
@@ -50,6 +55,8 @@ class TestAuthAndTokens(unittest.TestCase):
 
 
 class TestAccessControl(unittest.TestCase):
+    """Verify SHA-256 credential hashing and physical door access authorization decisions."""
+
     def test_sha256_hashing_and_normalization(self):
         h1 = mqtt_worker.hash_credential("A1B2C3D4:1234")
         h2 = mqtt_worker.hash_credential("  A1B2C3D4:1234\n")
@@ -95,6 +102,8 @@ class TestAccessControl(unittest.TestCase):
 
 
 class TestAIEngine(unittest.TestCase):
+    """Verify ASHRAE rules, missing sensor handling, trend noise filter, Z-score, and Isolation Forest."""
+
     def test_normal_reading_no_alarm(self):
         conn, _ = make_mock_conn(fetchall_val=[])
         with patch("ai_engine.get_conn", return_value=conn):
@@ -122,7 +131,7 @@ class TestAIEngine(unittest.TestCase):
 
     def test_noise_filter_blocks_false_positive_trend(self):
         base_ts = int(time.time())
-        # 15 stabile målinger omkring 22.0 C (±0.3 C støj) – må IKKE give falsk overophednings-forudsigelse
+        # 15 stable readings around 22.0 C (+/- 0.2 C jitter) must NOT trigger a false overheat prediction
         noisy_rows = [
             {"ts": base_ts - i * 5, "temperature": 22.0 + (0.2 if i % 2 == 0 else -0.2), "humidity": 45.0, "noise_db": 50.0}
             for i in range(15)
@@ -134,7 +143,7 @@ class TestAIEngine(unittest.TestCase):
 
     def test_real_heating_trend_returns_whole_integer_minutes(self):
         base_ts = int(time.time())
-        # Reel stigning fra 21.0 C til 24.5 C over 70 sek (ORDER BY time DESC -> nyeste først)
+        # Real temperature rise from 21.0 C to 24.5 C over 70s (ORDER BY time DESC -> newest first)
         rising_rows = [
             {"ts": base_ts - i * 5, "temperature": 24.5 - i * 0.25, "humidity": 45.0, "noise_db": 50.0}
             for i in range(15)
@@ -177,6 +186,8 @@ class TestAIEngine(unittest.TestCase):
 
 
 class TestMqttResilience(unittest.TestCase):
+    """Verify corrupt MQTT handling and fan auto-stop while keeping alarms latched."""
+
     def test_corrupt_json_payload_logged_without_crash(self):
         fake_msg = MagicMock()
         fake_msg.topic = "serverroom/pi1/telemetry"
@@ -185,7 +196,6 @@ class TestMqttResilience(unittest.TestCase):
             mqtt_worker._on_message(None, None, fake_msg)
         mock_log.assert_called_once()
         self.assertEqual(mock_log.call_args[0][1], "ERROR")
-
 
     def test_ai_autopilot_auto_clears_env_and_fan_when_normalized(self):
         mqtt_worker._last_auto_action_ts.clear()
@@ -196,7 +206,7 @@ class TestMqttResilience(unittest.TestCase):
         with patch("mqtt_worker.get_conn", return_value=conn), \
              patch("mqtt_worker.update_device_status"), \
              patch("mqtt_worker.publish_command") as mock_pub:
-            # 1. Overophedning -> både env_alarm og fan_auto
+            # Step 1: Overheating triggers BOTH latched alarm_test and fan_auto
             with patch("mqtt_worker.analyze_reading", return_value={"threshold_breached": True, "critical_action_needed": True, "is_anomaly": True, "score": -0.5, "reasons": ["Temp > 27"]}):
                 mqtt_worker._handle_telemetry("pi1", {"temperature": 28.5, "humidity": 45.0, "noise_db": 42.0})
             cmds_hot = [c[0][1] for c in mock_pub.call_args_list]
@@ -204,18 +214,17 @@ class TestMqttResilience(unittest.TestCase):
             self.assertIn("fan_auto", cmds_hot)
 
             mock_pub.reset_mock()
-            # 2. Normaliseret (< 27 C, normal fugt & støj) -> auto env_clear + fan_auto_off
+            # Step 2: Temp drops < 27 C -> auto-stops fan (fan_auto_off), does NOT auto-stop alarm
             with patch("mqtt_worker.analyze_reading", return_value={"threshold_breached": False, "critical_action_needed": False, "is_anomaly": False, "score": 0.1, "reasons": []}):
                 mqtt_worker._handle_telemetry("pi1", {"temperature": 25.0, "humidity": 45.0, "noise_db": 42.0})
             cmds_ok = [c[0][1] for c in mock_pub.call_args_list]
             self.assertNotIn("alarm_stop", cmds_ok)
             self.assertIn("fan_auto_off", cmds_ok)
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class TestHardeningAndAutomation(unittest.TestCase):
+    """Verify flatline fault detection, door brute-force alarm, AI autopilot, and server metrics."""
+
     def test_flatline_sensor_defect_detected(self):
         base_ts = int(time.time())
         stuck_rows = [
@@ -254,7 +263,6 @@ class TestHardeningAndAutomation(unittest.TestCase):
             mock_pub.assert_called_once()
             self.assertEqual(mock_pub.call_args[0][1], "fan_auto")
 
-
     def test_ai_autopilot_triggers_alarm_on_threshold_breach(self):
         mqtt_worker._last_auto_action_ts.clear()
         mqtt_worker._active_auto_fan.clear()
@@ -275,11 +283,13 @@ class TestHardeningAndAutomation(unittest.TestCase):
 
 
 class TestRBACAndUsers(unittest.TestCase):
+    """Verify PBKDF2-SHA256 salting, RBAC HTTP 403 enforcement, and disabled user lockout."""
+
     def test_pbkdf2_password_hash_and_verify(self):
         import auth_utils
         h1 = auth_utils.hash_password("Hemmeligt123!")
         h2 = auth_utils.hash_password("Hemmeligt123!")
-        self.assertNotEqual(h1, h2)  # Unik random salt hver gang
+        self.assertNotEqual(h1, h2)  # Unique random salt per hash
         self.assertNotIn("Hemmeligt123!", h1)
         self.assertTrue(auth_utils.verify_password("Hemmeligt123!", h1))
         self.assertFalse(auth_utils.verify_password("Forkert123!", h1))
@@ -304,3 +314,7 @@ class TestRBACAndUsers(unittest.TestCase):
         )
         with patch("auth_utils.get_conn", return_value=conn):
             self.assertIsNone(auth_utils.authenticate_user("spaerret", "StaerktPass99!"))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

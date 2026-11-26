@@ -1,10 +1,13 @@
+# Disable automatic HTTP port 80 binding so ONLY encrypted HTTPS (443) is exposed
 {
     auto_https off
 }
 
+# HTTPS reverse proxy terminating Let's Encrypt TLS and forwarding to internal FastAPI backend
 https://serverrum-iot-2026.swedencentral.cloudapp.azure.com {
     tls /certs/fullchain.pem /certs/privkey.pem
 
+    # Hardened HTTP security headers (HSTS, anti-MIME-sniffing, clickjacking protection, hide Server banner)
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"

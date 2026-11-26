@@ -252,11 +252,14 @@
   <div id="toast" class="toast hidden"></div>
 
   <script>
+    // Session token stored in browser sessionStorage (cleared when tab closes)
     let token = sessionStorage.getItem("iot_token") || "";
     let envChart, noiseChart, timer;
 
+    // Escape HTML special chars to prevent XSS when rendering database rows into tables
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 
+    // Display a temporary 3-second floating notification banner in the bottom-right corner
     function showToast(msg) {
       const t = document.getElementById("toast");
       t.textContent = msg;
@@ -264,6 +267,7 @@
       setTimeout(() => t.classList.add("hidden"), 3000);
     }
 
+    // Wrapper around fetch() that injects Bearer token and auto-logs out on HTTP 401
     async function api(url, opts = {}) {
       const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
       if (token) headers["Authorization"] = "Bearer " + token;
@@ -273,6 +277,7 @@
       return res.json();
     }
 
+    // Submit credentials to /api/login; handle 401 wrong password and 429 rate-limit lockout
     async function doLogin(e) {
       e.preventDefault();
       document.getElementById("login-err").textContent = "";
@@ -298,6 +303,7 @@
       }
     }
 
+    // Clear session token, stop polling timer, and return to the login overlay
     function logout() {
       token = "";
       sessionStorage.removeItem("iot_token");
@@ -306,6 +312,7 @@
       document.getElementById("login-screen").classList.remove("hidden");
     }
 
+    // Initialize Chart.js line charts for Temperature/Humidity and Noise (dB)
     function initCharts() {
       if (envChart) return;
       envChart = new Chart(document.getElementById("envChart"), {
@@ -325,6 +332,7 @@
       });
     }
 
+    // Poll /api/overview every 3 seconds and update KPIs, charts, health pills, and audit tables
     async function refresh() {
       try {
         const selDev = document.getElementById("dev-filter")?.value || "all";
@@ -434,6 +442,7 @@
       } catch (e) {}
     }
 
+    // Step-up authentication: verify current user's password before sending alarm_stop
     async function disarmAlarm(e) {
       e.preventDefault();
       const device_id = document.getElementById("cmd-dev").value.trim() || "pi1";
@@ -456,6 +465,7 @@
       refresh();
     }
 
+    // Toggle autonomous AI closed-loop fan/alarm autopilot on the backend
     async function toggleAuto() {
       const next = !window._autoCool;
       await api("/api/settings/auto-cooling", { method: "POST", body: JSON.stringify({ enabled: next }) });
@@ -463,6 +473,7 @@
       refresh();
     }
 
+    // Publish a two-way remote control command (door, fan, alarm, ping, reset) via MQTT
     async function sendCmd(command, payload) {
       const device_id = document.getElementById("cmd-dev").value.trim() || "pi1";
       await api("/api/command", { method: "POST", body: JSON.stringify({ device_id, command, payload }) });
@@ -470,6 +481,7 @@
       refresh();
     }
 
+    // Register a new physical RFID/PIN card (hashed with SHA-256 on the backend)
     async function addCard(e) {
       e.preventDefault();
       await api("/api/access/cards", {
@@ -486,11 +498,13 @@
       refresh();
     }
 
+    // Enable or revoke an access card immediately
     async function toggleCard(id) {
       await api(`/api/access/cards/${id}/toggle`, { method: "PATCH" });
       refresh();
     }
 
+    // Admin-only: create or update a dashboard RBAC user (PBKDF2-SHA256)
     async function addDashUser(e) {
       e.preventDefault();
       await api("/api/users", {
@@ -506,20 +520,24 @@
       showToast("Dashboard-bruger gemt (PBKDF2-SHA256)");
       refresh();
     }
+    // Admin-only: toggle active/disabled status on a dashboard user
     async function toggleUser(id) {
       await api(`/api/users/${id}/toggle`, { method: "PATCH" });
       refresh();
     }
+    // Admin-only: delete a dashboard user
     async function delUser(id) {
       await api(`/api/users/${id}`, { method: "DELETE" });
       refresh();
     }
 
+    // Delete a physical access card
     async function delCard(id) {
       await api(`/api/access/cards/${id}`, { method: "DELETE" });
       refresh();
     }
 
+    // Download authenticated CSV exports (sensors or AI anomalies) with current device filter
     async function downloadCsv(url, filename) {
       const sel = document.getElementById("dev-filter")?.value || "all";
       const fullUrl = url.includes("sensors") ? `${url}?device_id=${encodeURIComponent(sel)}` : url;
@@ -534,6 +552,7 @@
       showToast("Downloadet " + filename);
     }
 
+    // Show the main dashboard and start the 3-second live refresh polling loop
     function startApp() {
       document.getElementById("login-screen").classList.add("hidden");
       document.getElementById("app").classList.remove("hidden");
@@ -543,6 +562,7 @@
       timer = setInterval(refresh, 3000);
     }
 
+    // Auto-resume session if a valid token is already in sessionStorage
     if (token) startApp();
   </script>
 </body>

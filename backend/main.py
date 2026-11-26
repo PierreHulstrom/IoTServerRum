@@ -1,3 +1,13 @@
+"""FastAPI REST API & Operations Center web server for the Server Room IoT platform.
+
+Handles:
+  - Login with PBKDF2-SHA256 verification, 429 brute-force rate-limiting, and HMAC bearer tokens.
+  - Role-Based Access Control (admin, operator, viewer).
+  - Live dashboard overview (sensor telemetry, AI anomalies, access control, Azure server health).
+  - Two-way remote control commands and step-up password-authenticated alarm disarm.
+  - Authenticated CSV exports for report analysis.
+"""
+
 import base64
 import csv
 import io
@@ -32,19 +42,21 @@ from mqtt_worker import (
     start_mqtt,
 )
 
+# Security configuration loaded strictly from .env (no hardcoded fallback passwords)
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
 DASHBOARD_PASS = os.getenv("DASHBOARD_PASS")
 _RAW_SECRET = os.getenv("DASHBOARD_SECRET_KEY")
 SECRET_KEY = _RAW_SECRET.encode("utf-8") if _RAW_SECRET else None
-TOKEN_TTL_SEC = 12 * 3600
+TOKEN_TTL_SEC = 12 * 3600  # Bearer session token lifetime: 12 hours
 
-# Brute-force rate-limiter på web-login (5 fejlforsøg pr. IP inden for 5 min -> 429)
+# Web-login brute-force rate limiter: max 5 failed attempts per (IP + username) in 5 minutes -> HTTP 429
 LOGIN_MAX_ATTEMPTS = 5
 LOGIN_WINDOW_SEC = 300
 _login_failures: dict[str, list[float]] = defaultdict(list)
 
 
 def get_server_metrics() -> dict:
+    """Read live Linux host health metrics (CPU load, RAM %, Disk %, Uptime) for the dashboard."""
     load_1m = 0.0
     try:
         load_1m = round(os.getloadavg()[0], 2)
@@ -91,6 +103,7 @@ def get_server_metrics() -> dict:
 
 
 def create_token(username: str, role: str = "admin") -> str:
+    """Generate a signed HMAC-SHA256 session token containing username, role, and expiry."""
     if not SECRET_KEY:
         raise RuntimeError("DASHBOARD_SECRET_KEY mangler i .env")
     payload = json.dumps(
@@ -102,6 +115,7 @@ def create_token(username: str, role: str = "admin") -> str:
 
 
 def verify_session(authorization: str | None = Header(default=None)) -> dict:
+    """FastAPI dependency: verify Bearer token signature and expiry, returning {username, role}."""
     if not SECRET_KEY:
         raise HTTPException(status_code=500, detail="Server-konfigurationsfejl")
     if not authorization or not authorization.startswith("Bearer "):
@@ -110,6 +124,7 @@ def verify_session(authorization: str | None = Header(default=None)) -> dict:
     try:
         b64, sig = token.split(".", 1)
         expected = hmac.new(SECRET_KEY, b64.encode("utf-8"), hashlib.sha256).hexdigest()
+        # Constant-time digest comparison prevents timing attacks
         if not hmac.compare_digest(sig, expected):
             raise HTTPException(status_code=401, detail="Ugyldigt token")
         data = json.loads(base64.urlsafe_b64decode(b64.encode("utf-8")).decode("utf-8"))
@@ -123,10 +138,12 @@ def verify_session(authorization: str | None = Header(default=None)) -> dict:
 
 
 def verify_token(authorization: str | None = Header(default=None)) -> str:
+    """Convenience wrapper returning only the authenticated username."""
     return verify_session(authorization)["username"]
 
 
 def require_role(*allowed_roles: str):
+    """FastAPI RBAC dependency factory: raises HTTP 403 if the user's role is not allowed."""
     def _dep(session: dict = Depends(verify_session)) -> dict:
         if session["role"] not in allowed_roles:
             raise HTTPException(status_code=403, detail=f"Manglende rettighed (rolle: {session['role']})")
@@ -136,6 +153,7 @@ def require_role(*allowed_roles: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Startup hook: enforce required .env secrets, bootstrap admin user, and start MQTT worker."""
     if not DASHBOARD_PASS or not SECRET_KEY:
         raise RuntimeError("DASHBOARD_PASS og DASHBOARD_SECRET_KEY SKAL være sat i .env!")
     bootstrap_admin(DASHBOARD_USER, DASHBOARD_PASS)
@@ -148,57 +166,70 @@ app = FastAPI(title="Serverrum IoT Platform", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+# --- Pydantic request schemas ---
 class LoginReq(BaseModel):
+    """Payload for POST /api/login."""
     username: str
     password: str
 
 
 class CommandReq(BaseModel):
+    """Payload for POST /api/command (two-way MQTT remote control)."""
     device_id: str = "pi1"
     command: str
     payload: dict = {}
 
 
 class CardReq(BaseModel):
+    """Payload for registering a new physical RFID/PIN access credential."""
     owner_name: str
     role: str = "staff"
     credential: str
 
 
 class AutoCoolingReq(BaseModel):
+    """Payload for toggling autonomous AI closed-loop cooling/alarm control."""
     enabled: bool
 
 
 class DisarmReq(BaseModel):
+    """Payload for step-up password-protected alarm disarm (POST /api/alarm/disarm)."""
     device_id: str = "pi1"
     password: str
 
 
 class UserCreateReq(BaseModel):
+    """Payload for creating or updating a dashboard RBAC user."""
     username: str
     password: str
     role: str = "admin"
 
 
+# --- Public & authentication routes ---
 @app.get("/")
 def serve_dashboard():
+    """Serve the single-page Operations Center dashboard."""
     return FileResponse("static/index.html")
 
 
 @app.get("/api/health")
 def health():
+    """Unauthenticated health probe reporting MariaDB and Mosquitto connectivity."""
     return {"status": "ok", "db": db_ping(), "mqtt": mqtt_is_connected()}
 
 
 @app.post("/api/login")
 def login(req: LoginReq, request: Request):
+    """Authenticate a user with per-(IP + username) rate limiting and issue an HMAC token."""
     if not SECRET_KEY:
         raise HTTPException(status_code=500, detail="Auth ikke konfigureret")
 
+    # Resolve real client IP behind Caddy reverse proxy
     client_ip = (request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
     if not client_ip:
         client_ip = request.client.host if request.client else "unknown"
 
+    # Sliding-window rate limit keyed on IP + username so shared school Wi-Fi users are not blocked
     rate_key = f"{client_ip}:{req.username.strip().lower()}"
     now = time.time()
     recent = [t for t in _login_failures[rate_key] if now - t <= LOGIN_WINDOW_SEC]
@@ -229,11 +260,14 @@ def login(req: LoginReq, request: Request):
     }
 
 
+# --- Dashboard data & telemetry routes ---
 @app.get("/api/overview")
 def overview(device_id: str | None = None, session: dict = Depends(verify_session)):
+    """Return all live dashboard panels in one call (optionally filtered by sensor device_id)."""
     dev_filter = device_id.strip() if device_id and device_id.strip() not in ("", "all") else None
     with get_conn() as conn:
         with conn.cursor() as cur:
+            # Fetch latest 60 sensor readings in chronological order for charts
             if dev_filter:
                 cur.execute(
                     """
@@ -256,6 +290,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
                 )
             readings = list(reversed(cur.fetchall()))
 
+            # Connected edge devices & last heartbeat timestamps
             cur.execute(
                 """
                 SELECT device_id, status,
@@ -265,6 +300,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
             )
             devices = cur.fetchall()
 
+            # Latest AI anomalies and overheating predictions
             cur.execute(
                 """
                 SELECT id, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
@@ -274,6 +310,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
             )
             anomalies = cur.fetchall()
 
+            # Registered physical access cards (only truncated SHA-256 preview is returned)
             cur.execute(
                 """
                 SELECT id, owner_name, role, is_active,
@@ -284,6 +321,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
             )
             cards = cur.fetchall()
 
+            # Recent physical door access attempts
             cur.execute(
                 """
                 SELECT id, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
@@ -293,6 +331,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
             )
             access_logs = cur.fetchall()
 
+            # Central audit, security, AI, and fail2ban system logs
             cur.execute(
                 """
                 SELECT id, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
@@ -302,6 +341,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
             )
             system_logs = cur.fetchall()
 
+            # Remote control command history
             cur.execute(
                 """
                 SELECT id, DATE_FORMAT(time, '%Y-%m-%d %H:%i:%s') AS time,
@@ -311,6 +351,7 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
             )
             commands = cur.fetchall()
 
+            # Only admins receive the dashboard user list
             users = []
             if session["role"] == "admin":
                 cur.execute(
@@ -338,8 +379,10 @@ def overview(device_id: str | None = None, session: dict = Depends(verify_sessio
     }
 
 
+# --- Remote control & physical access card routes (admin + operator) ---
 @app.post("/api/settings/auto-cooling")
 def toggle_auto_cooling(req: AutoCoolingReq, session: dict = Depends(require_role("admin", "operator"))):
+    """Enable or disable autonomous AI closed-loop fan/alarm actions."""
     state = set_auto_cooling(req.enabled)
     log_system("ai_autopilot", "INFO", f"Autonom AI-køling sat til {'TIL' if state else 'FRA'} af {session['username']}")
     return {"auto_cooling": state}
@@ -347,11 +390,13 @@ def toggle_auto_cooling(req: AutoCoolingReq, session: dict = Depends(require_rol
 
 @app.post("/api/command")
 def send_command(req: CommandReq, session: dict = Depends(require_role("admin", "operator"))):
+    """Publish a remote-control command over MQTT to a target Raspberry Pi / Elegoo node."""
     return publish_command(req.device_id, req.command, req.payload, issued_by=session["username"])
 
 
 @app.post("/api/access/cards")
 def add_card(req: CardReq, session: dict = Depends(require_role("admin", "operator"))):
+    """Hash a new RFID UID / 2FA PIN with SHA-256 and store it in access_cards."""
     if len(req.credential.strip()) < 3:
         raise HTTPException(status_code=400, detail="Kort-UID/PIN skal være mindst 3 tegn")
     cred_hash = hash_credential(req.credential)
@@ -370,6 +415,7 @@ def add_card(req: CardReq, session: dict = Depends(require_role("admin", "operat
 
 @app.patch("/api/access/cards/{card_id}/toggle")
 def toggle_card(card_id: int, session: dict = Depends(require_role("admin", "operator"))):
+    """Enable or revoke an existing physical access card immediately."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE access_cards SET is_active = NOT is_active WHERE id = %s", (card_id,))
@@ -379,6 +425,7 @@ def toggle_card(card_id: int, session: dict = Depends(require_role("admin", "ope
 
 @app.delete("/api/access/cards/{card_id}")
 def delete_card(card_id: int, session: dict = Depends(require_role("admin", "operator"))):
+    """Permanently delete a physical access card from MariaDB."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM access_cards WHERE id = %s", (card_id,))
@@ -386,8 +433,10 @@ def delete_card(card_id: int, session: dict = Depends(require_role("admin", "ope
     return {"status": "deleted"}
 
 
+# --- Dashboard user & RBAC management routes (admin only) ---
 @app.post("/api/users")
 def create_dashboard_user(req: UserCreateReq, session: dict = Depends(require_role("admin"))):
+    """Create or update a dashboard user account with PBKDF2-SHA256 password hashing."""
     if len(req.username.strip()) < 2 or len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Brugernavn >= 2 tegn og kodeord >= 8 tegn")
     if req.role.strip().lower() not in VALID_ROLES:
@@ -399,6 +448,7 @@ def create_dashboard_user(req: UserCreateReq, session: dict = Depends(require_ro
 
 @app.patch("/api/users/{user_id}/toggle")
 def toggle_dashboard_user(user_id: int, session: dict = Depends(require_role("admin"))):
+    """Toggle active/disabled state for a dashboard user (prevents self-lockout)."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT username FROM dashboard_users WHERE id = %s", (user_id,))
@@ -414,6 +464,7 @@ def toggle_dashboard_user(user_id: int, session: dict = Depends(require_role("ad
 
 @app.delete("/api/users/{user_id}")
 def delete_dashboard_user(user_id: int, session: dict = Depends(require_role("admin"))):
+    """Delete a dashboard user account (prevents deleting the currently logged-in admin)."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT username FROM dashboard_users WHERE id = %s", (user_id,))
@@ -427,8 +478,10 @@ def delete_dashboard_user(user_id: int, session: dict = Depends(require_role("ad
     return {"status": "deleted"}
 
 
+# --- Authenticated CSV data export routes (UTF-8 BOM for Excel compatibility) ---
 @app.get("/api/export/sensors.csv")
 def export_sensors_csv(device_id: str | None = None, session: dict = Depends(verify_session)):
+    """Export up to 5,000 recent sensor readings as a UTF-8 CSV file."""
     dev_filter = device_id.strip() if device_id and device_id.strip() not in ("", "all") else None
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -458,7 +511,7 @@ def export_sensors_csv(device_id: str | None = None, session: dict = Depends(ver
         w.writerow([r["time"], r["device_id"], r["zone"], r["temperature"], r["humidity"], r["noise_db"]])
     log_system("export", "INFO", f"Sensordata CSV eksporteret ({len(rows)} rækker) af {session['username']}")
     return Response(
-        content="﻿" + buf.getvalue(),
+        content="\ufeff" + buf.getvalue(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=serverroom_sensors.csv"},
     )
@@ -466,6 +519,7 @@ def export_sensors_csv(device_id: str | None = None, session: dict = Depends(ver
 
 @app.get("/api/export/anomalies.csv")
 def export_anomalies_csv(session: dict = Depends(verify_session)):
+    """Export up to 2,000 AI anomalies and predictions as a UTF-8 CSV file."""
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -483,14 +537,16 @@ def export_anomalies_csv(session: dict = Depends(verify_session)):
         w.writerow([r["time"], r["device_id"], r["anomaly_score"], r["is_anomaly"], r["predicted_critical_min"], r["message"]])
     log_system("export", "INFO", f"AI-alarmer CSV eksporteret ({len(rows)} rækker) af {session['username']}")
     return Response(
-        content="﻿" + buf.getvalue(),
+        content="\ufeff" + buf.getvalue(),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": "attachment; filename=serverroom_ai_anomalies.csv"},
     )
 
 
+# --- Step-up authenticated alarm disarm route ---
 @app.post("/api/alarm/disarm")
 def disarm_alarm(req: DisarmReq, session: dict = Depends(require_role("admin", "operator"))):
+    """Require the logged-in user's personal password again before disarming an active alarm."""
     verified = authenticate_user(session["username"], req.password)
     if not verified:
         log_system("auth", "WARNING", f"Fejlet alarm-afstilling (forkert kodeord) af '{session['username']}'")

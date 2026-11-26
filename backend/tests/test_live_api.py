@@ -1,3 +1,5 @@
+"""Live black-box integration tests against the running FastAPI backend and public HTTPS endpoint."""
+
 import json
 import os
 import socket
@@ -14,6 +16,7 @@ PASS = os.getenv("DASHBOARD_PASS", "")
 
 
 def req(url, method="GET", body=None, headers=None, timeout=5):
+    """Execute an HTTP/HTTPS request and return (status_code, headers_dict, body_str)."""
     hdrs = dict(headers or {})
     data = None
     if body is not None:
@@ -28,6 +31,8 @@ def req(url, method="GET", body=None, headers=None, timeout=5):
 
 
 class TestLiveAPIAndSecurity(unittest.TestCase):
+    """Verify health, auth enforcement, SQLi resistance, TLS headers, and closed port 80."""
+
     def test_01_health_endpoint_db_and_mqtt_online(self):
         code, _, body = req(f"{BASE_LOCAL}/api/health")
         data = json.loads(body)
@@ -82,11 +87,9 @@ class TestLiveAPIAndSecurity(unittest.TestCase):
             s.close()
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestLiveRateLimit(unittest.TestCase):
+    """Verify web-login brute-force rate limiter returns HTTP 429 on the 6th failed attempt."""
+
     def test_08_login_rate_limit_returns_429(self):
         hdrs = {"X-Forwarded-For": "203.0.113.99"}
         codes = []
@@ -103,6 +106,8 @@ class TestLiveRateLimit(unittest.TestCase):
 
 
 class TestLiveCSVExport(unittest.TestCase):
+    """Verify CSV export requires login and returns valid text/csv headers."""
+
     def test_09_csv_export_blocked_without_login(self):
         c, _, _ = req(f"{BASE_LOCAL}/api/export/sensors.csv")
         self.assertEqual(c, 401)
@@ -118,6 +123,8 @@ class TestLiveCSVExport(unittest.TestCase):
 
 
 class TestLiveAlarmDisarm(unittest.TestCase):
+    """Verify step-up password authentication on POST /api/alarm/disarm."""
+
     def test_11_disarm_alarm_rejects_wrong_password(self):
         c, _, body = req(f"{BASE_LOCAL}/api/login", method="POST", body={"username": USER, "password": PASS})
         self.assertEqual(c, 200)
@@ -142,3 +149,7 @@ class TestLiveAlarmDisarm(unittest.TestCase):
         )
         self.assertEqual(c2, 200)
         self.assertEqual(json.loads(body2)["status"], "disarmed")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

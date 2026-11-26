@@ -1,3 +1,13 @@
+"""Raspberry Pi Edge Bridge connecting Elegoo/Arduino (USB Serial) to Azure MQTTS (port 8883).
+
+Features:
+  - TLS-encrypted MQTTS with username/password authentication and Last Will & Testament (LWT).
+  - Local SQLite offline buffer so telemetry is never lost during temporary hotspot outages.
+  - USB serial auto-detection (/dev/ttyACM* and /dev/ttyUSB*) with safe hot-unplug handling.
+  - Compact JSON forwarding (<25 bytes) to stay safely inside Arduino's 64-byte RX buffer.
+  - Optional --simulate mode for testing without physical Arduino hardware attached.
+"""
+
 import argparse
 import glob
 import json
@@ -12,6 +22,7 @@ import paho.mqtt.client as mqtt
 
 
 def load_env(path=".env"):
+    """Load key=value settings from local .env without overriding existing environment variables."""
     if not os.path.exists(path):
         return
     with open(path, "r", encoding="utf-8") as f:
@@ -25,6 +36,7 @@ def load_env(path=".env"):
 
 load_env()
 
+# Edge node & Azure MQTTS connection configuration
 MQTT_HOST = os.getenv("MQTT_HOST", "serverrum-iot-2026.swedencentral.cloudapp.azure.com")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USER = os.getenv("MQTT_USER", "pi-node")
@@ -36,7 +48,8 @@ SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 
 
 class OfflineBuffer:
-    """Lokal SQLite-kø så sensordata ikke tabes ved midlertidigt hotspot-udfald."""
+    """Thread-safe local SQLite FIFO queue so sensor data survives temporary network outages."""
+
     def __init__(self, db_path="offline_buffer.db"):
         self.lock = threading.Lock()
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -46,22 +59,27 @@ class OfflineBuffer:
         self.conn.commit()
 
     def push(self, topic: str, payload: str):
+        """Enqueue one unsent MQTT message to disk."""
         with self.lock:
             self.conn.execute("INSERT INTO queue (topic, payload) VALUES (?, ?)", (topic, payload))
             self.conn.commit()
 
     def pop_batch(self, limit=25):
+        """Read the oldest queued messages for replay after reconnecting."""
         with self.lock:
             rows = self.conn.execute("SELECT id, topic, payload FROM queue ORDER BY id ASC LIMIT ?", (limit,)).fetchall()
             return rows
 
     def delete(self, row_id: int):
+        """Remove a queued message once Azure confirms delivery."""
         with self.lock:
             self.conn.execute("DELETE FROM queue WHERE id = ?", (row_id,))
             self.conn.commit()
 
 
 class PiBridge:
+    """Main bidirectional bridge between Arduino USB Serial and Azure MQTTS."""
+
     def __init__(self, simulate=False, serial_port=SERIAL_PORT, baud=SERIAL_BAUD):
         self.simulate = simulate
         self.serial_port = serial_port
@@ -72,12 +90,13 @@ class PiBridge:
         self.sim_temp = 22.0
         self.sim_heating = False
 
+        # Configure TLS-encrypted MQTT client
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"edge-{DEVICE_ID}")
         self.client.username_pw_set(MQTT_USER, MQTT_PASS)
         self.client.tls_set_context(ssl.create_default_context())
         self.client.reconnect_delay_set(min_delay=2, max_delay=30)
 
-        # Last Will & Testament (Delspørgsmål 3: automatisk nedbrudsregistrering)
+        # Last Will & Testament (LWT): Mosquitto auto-publishes offline if the Pi drops unexpectedly
         self.client.will_set(
             f"serverroom/{DEVICE_ID}/status",
             json.dumps({"status": "offline", "reason": "lwt_disconnect"}),
@@ -89,6 +108,7 @@ class PiBridge:
         self.client.on_message = self._on_message
 
     def _on_connect(self, client, userdata, flags, rc, properties):
+        """Subscribe to command/access topics, announce online status, and flush offline buffer."""
         self.connected = (rc == 0)
         print(f"[MQTTS] Forbundet til {MQTT_HOST}:{MQTT_PORT} (rc={rc})")
         if self.connected:
@@ -102,10 +122,12 @@ class PiBridge:
             self._flush_buffer()
 
     def _on_disconnect(self, client, userdata, flags, rc, properties):
+        """Switch to local SQLite buffering when MQTTS connection drops."""
         self.connected = False
         print(f"[MQTTS] Afbrudt (rc={rc}) – buffer aktiveret lokalt i SQLite")
 
     def _on_message(self, client, userdata, msg):
+        """Receive remote commands or access decisions from Azure and forward to Arduino."""
         raw = msg.payload.decode("utf-8", errors="ignore")
         print(f"[AZURE -> PI] Topic: {msg.topic} | Besked: {raw}", flush=True)
         try:
@@ -114,6 +136,7 @@ class PiBridge:
             return
 
         if msg.topic == f"serverroom/{DEVICE_ID}/cmd":
+            # Compact JSON (<25 bytes) avoids overflowing Arduino's 64-byte hardware RX buffer
             out = {"cmd": data.get("command")}
             self._send_to_arduino(out)
         elif msg.topic == "serverroom/access/response":
@@ -126,6 +149,7 @@ class PiBridge:
             self._send_to_arduino(out)
 
     def _send_to_arduino(self, obj: dict):
+        """Write one newline-terminated JSON object to Arduino; safely recovers on USB hot-unplug."""
         line = json.dumps(obj, separators=(",", ":")) + "\n"
         try:
             if self.ser and self.ser.is_open:
@@ -144,6 +168,7 @@ class PiBridge:
             self.ser = None
 
     def _publish_now(self, topic: str, payload_obj: dict, retain=False):
+        """Publish to Azure immediately if connected, otherwise store in the SQLite offline queue."""
         payload = json.dumps(payload_obj)
         if self.connected:
             info = self.client.publish(topic, payload, qos=1, retain=retain)
@@ -154,6 +179,7 @@ class PiBridge:
         return False
 
     def _flush_buffer(self):
+        """Replay up to 50 buffered messages in FIFO order once connectivity is restored."""
         rows = self.buffer.pop_batch(50)
         if rows:
             print(f"[BUFFER] Sender {len(rows)} gemte beskeder til Azure...")
@@ -165,6 +191,7 @@ class PiBridge:
                 self.buffer.delete(row_id)
 
     def handle_arduino_message(self, data: dict):
+        """Dispatch parsed JSON lines from Arduino to the appropriate Azure MQTT topic."""
         msg_type = data.get("type", "telemetry")
         if msg_type == "telemetry":
             payload = {
@@ -190,6 +217,7 @@ class PiBridge:
             print(f"[PI -> AZURE] Dørhændelse: {data}")
 
     def _heartbeat_loop(self):
+        """Send an online heartbeat every 20s and flush any buffered offline messages."""
         while True:
             time.sleep(20)
             if self.connected:
@@ -201,12 +229,14 @@ class PiBridge:
                 self._flush_buffer()
 
     def _detect_serial_port(self):
+        """Auto-detect the active Arduino/Elegoo USB serial device (/dev/ttyACM* or /dev/ttyUSB*)."""
         if self.serial_port and self.serial_port != "auto" and os.path.exists(self.serial_port):
             return self.serial_port
         candidates = sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
         return candidates[0] if candidates else None
 
     def _serial_loop(self):
+        """Continuously read JSON telemetry/events over USB Serial with automatic reconnect."""
         import serial
         while True:
             port = self._detect_serial_port()
@@ -217,7 +247,7 @@ class PiBridge:
             try:
                 print(f"[SERIAL] Åbner {port} @ {self.baud} baud...", flush=True)
                 self.ser = serial.Serial(port, self.baud, timeout=1)
-                time.sleep(2)
+                time.sleep(2)  # Allow Arduino auto-reset to finish after serial open
                 print("[SERIAL] Forbundet til Arduino!")
                 while True:
                     raw = self.ser.readline().decode("utf-8", errors="ignore").strip()
@@ -232,6 +262,7 @@ class PiBridge:
                 time.sleep(5)
 
     def _sim_input_loop(self):
+        """Interactive stdin commands available when running in --simulate mode."""
         print("\n[SIMULATOR-KOMMANDOER] Skriv i terminalen og tryk Enter:")
         print("  heat        -> Start temperaturstigning (tester AI-forudsigelse)")
         print("  cool        -> Normal temperatur igen")
@@ -256,6 +287,7 @@ class PiBridge:
                 self.handle_arduino_message({"type": "access_request", "credential": cred, "method": "sim"})
 
     def _simulate_loop(self):
+        """Generate realistic synthetic telemetry every 5s when running without Arduino hardware."""
         threading.Thread(target=self._sim_input_loop, daemon=True).start()
         while True:
             if self.sim_heating:
@@ -272,6 +304,7 @@ class PiBridge:
             time.sleep(5)
 
     def run(self):
+        """Start MQTT loop, heartbeat thread, and either USB serial or simulator mode."""
         if not MQTT_PASS:
             print("FEJL: MQTT_PASS mangler i .env!")
             sys.exit(1)

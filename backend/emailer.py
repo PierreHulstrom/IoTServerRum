@@ -1,7 +1,8 @@
-"""Letvægts Azure Communication Services (ACS) Email-afsender (REST API 2023-03-31).
+"""Lightweight Azure Communication Services (ACS) Email sender (REST API 2023-03-31).
 
-Bruger ren Python stdlib (HMAC-SHA256 + HTTPSConnection) uden tunge SDK-afhængigheder,
-så både FastAPI/MQTT-backend og værtens fail2ban-hook kan sende sikkerhedsmails hurtigt.
+Uses pure Python stdlib (HMAC-SHA256 signing + HTTPSConnection) with zero external
+SDK dependencies so both the FastAPI/MQTT backend and host fail2ban hooks can send
+security alerts to school Outlook accounts reliably over HTTPS.
 """
 
 from __future__ import annotations
@@ -24,12 +25,13 @@ from typing import Iterable, Optional, Tuple
 ACS_API_PATH = "/emails:send?api-version=2023-03-31"
 DASHBOARD_URL = "https://serverrum-iot-2026.swedencentral.cloudapp.azure.com"
 
+# Thread-safe per-alert cooldown tracker to prevent inbox spam
 _COOLDOWN_LOCK = threading.Lock()
 _LAST_SENT: dict[str, float] = {}
 
 
 def _load_dotenv_fallback(env_path: str = "/opt/serverroom-iot/.env") -> None:
-    """Indlæs manglende miljøvariabler fra .env ved CLI-kørsel på værten."""
+    """Load ACS settings from .env when invoked directly from the host CLI."""
     if os.getenv("ACS_CONNECTION_STRING") or not os.path.isfile(env_path):
         return
     try:
@@ -48,7 +50,7 @@ def _load_dotenv_fallback(env_path: str = "/opt/serverroom-iot/.env") -> None:
 
 
 def parse_connection_string(conn_str: str) -> Tuple[str, str]:
-    """Udtrækker (endpoint, access_key) fra en Azure ACS connection string."""
+    """Extract and validate (https endpoint, base64 access_key) from an ACS connection string."""
     endpoint = ""
     access_key = ""
     for part in conn_str.strip().strip('"').strip("'").split(";"):
@@ -63,6 +65,7 @@ def parse_connection_string(conn_str: str) -> Tuple[str, str]:
             access_key = v
     if not endpoint or not access_key:
         raise ValueError("ACS_CONNECTION_STRING mangler endpoint eller accesskey")
+    # Enforce HTTPS-only endpoint to prevent insecure plaintext calls
     parsed = urllib.parse.urlparse(endpoint)
     if parsed.scheme != "https" or not parsed.netloc:
         raise ValueError("ACS endpoint skal være en gyldig https://-adresse")
@@ -70,11 +73,13 @@ def parse_connection_string(conn_str: str) -> Tuple[str, str]:
 
 
 def get_recipients(override: Optional[Iterable[str]] = None) -> list[str]:
+    """Parse comma-separated recipient email addresses from ALERT_EMAIL_TO."""
     raw_list = override if override is not None else os.getenv("ALERT_EMAIL_TO", "").split(",")
     return [addr.strip() for addr in raw_list if addr and "@" in addr.strip()]
 
 
 def is_configured() -> bool:
+    """Return True if ACS connection string, sender address, and recipients are all set."""
     return bool(
         os.getenv("ACS_CONNECTION_STRING", "").strip()
         and os.getenv("ACS_SENDER_ADDRESS", "").strip()
@@ -83,6 +88,7 @@ def is_configured() -> bool:
 
 
 def _build_html(subject: str, body: str, severity: str) -> str:
+    """Render an XSS-escaped dark NOC HTML email body with severity banner."""
     colors = {
         "CRITICAL": "#dc2626",
         "ERROR": "#dc2626",
@@ -91,6 +97,7 @@ def _build_html(subject: str, body: str, severity: str) -> str:
     }
     badge_color = colors.get(severity.upper(), "#2563eb")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Escape all dynamic values so untrusted IPs/usernames cannot inject HTML
     safe_subject = html.escape(subject)
     safe_body = html.escape(body).replace("\n", "<br>")
     safe_sev = html.escape(severity.upper())
@@ -119,7 +126,7 @@ def send_email(
     recipients: Optional[Iterable[str]] = None,
     timeout: int = 15,
 ) -> Tuple[bool, str]:
-    """Sender en mail via Azure Communication Services Email REST API."""
+    """Sign and POST an email payload to Azure Communication Services over HTTPS."""
     conn_str = os.getenv("ACS_CONNECTION_STRING", "").strip()
     sender = os.getenv("ACS_SENDER_ADDRESS", "").strip()
     to_list = get_recipients(recipients)
@@ -144,6 +151,7 @@ def send_email(
         }
         body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
+        # Compute required Azure ACS HMAC-SHA256 request signature headers
         request_date = email.utils.formatdate(usegmt=True)
         content_hash = base64.b64encode(hashlib.sha256(body_bytes).digest()).decode("ascii")
         string_to_sign = f"POST\n{ACS_API_PATH}\n{request_date};{host};{content_hash}"
@@ -181,7 +189,7 @@ def send_alert_async(
     severity: str = "WARNING",
     cooldown_sec: int = 300,
 ) -> bool:
-    """Sender mail i en baggrundstråd med cooldown, så HTTP/MQTT aldrig blokeres."""
+    """Send an email in a background daemon thread with per-key cooldown protection."""
     if not is_configured():
         return False
     now = time.monotonic()
@@ -201,6 +209,7 @@ def send_alert_async(
 
 
 if __name__ == "__main__":
+    # Manual CLI test: python3 emailer.py --test
     _load_dotenv_fallback()
     if "--test" in sys.argv:
         ok, detail = send_email(

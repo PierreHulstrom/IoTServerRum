@@ -1,3 +1,5 @@
+"""Offline unit tests for Azure Communication Services Email parsing, XSS escaping, and cooldown."""
+
 import os
 import unittest
 from unittest.mock import patch
@@ -6,6 +8,8 @@ import emailer
 
 
 class TestEmailer(unittest.TestCase):
+    """Validate ACS Email connection string security, HTML escaping, and anti-spam cooldown."""
+
     def test_parse_connection_string_valid(self):
         ep, key = emailer.parse_connection_string(
             "endpoint=https://serverrum-acs.europe.communication.azure.com/;accesskey=dGVzdGtleQ=="

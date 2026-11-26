@@ -1,4 +1,4 @@
-"""Kaldes af værtens fail2ban ved SSH-ban: logger i MariaDB (Dashboard) og sender Azure Email."""
+"""Called by host fail2ban on SSH ban: writes to MariaDB system_logs and sends an Azure Email."""
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ from emailer import send_email
 
 
 def _clean(val: str, max_len: int = 80) -> str:
+    """Strip control whitespace and cap length on untrusted CLI arguments."""
     return re.sub(r"[\r\n\t]+", " ", str(val or "")).strip()[:max_len]
 
 
 def _write_system_log(message: str, details: dict) -> tuple[bool, str]:
+    """Insert the SSH ban event into system_logs so it appears live in the dashboard."""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -28,6 +30,7 @@ def _write_system_log(message: str, details: dict) -> tuple[bool, str]:
 
 
 def main() -> int:
+    """Entry point invoked via docker exec by scripts/fail2ban_notify.sh."""
     ip = _clean(sys.argv[1] if len(sys.argv) > 1 else "ukendt", 64)
     jail = _clean(sys.argv[2] if len(sys.argv) > 2 else "sshd", 32)
     failures = _clean(sys.argv[3] if len(sys.argv) > 3 else "flere", 16)
